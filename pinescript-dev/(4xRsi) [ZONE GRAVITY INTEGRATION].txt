@@ -1,0 +1,530 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © majhikeshab5
+
+//@version=6
+indicator("Helper_1(4xRsi) [ZONE GRAVITY INTEGRATION]" , precision=3, overlay=false, max_boxes_count=500, max_labels_count=500, dynamic_requests=true)
+
+import bankniftyexplorer/kibrary/4 as k
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+length = input.int(12, title='Rsi Length', minval=1  , group = 'Rsi')
+smooth = input.int(2, title=' Smooth', minval=1  , group = 'Rsi')
+DECAY_FACTOR = input.float(0.99 , "DECAY_FACTOR", maxval = 1.0 , minval = 0.00001)
+
+
+// Malen = input.int(150, title=' Ma Length', minval=1 ,  group = 'EDSMA')
+// ssfLength = input.int(title='Super Smoother Filter Length', minval=1, defval= 50 ,  group = 'EDSMA')
+// ssfPoles = input.int(title='Super Smoother Filter Poles', defval=3, options=[2, 3] ,  group = 'EDSMA')
+
+candle_mrk_len  = input.int(60, title='Mark Length', minval=1)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+f_LastHLbar(series float high_src, series float low_src, series float linked_high ,series float linked_low) =>
+    var float candidateHigh = na
+    candidateHigh := high_src[1] > high_src[2] and high_src[1] > high_src ? math.max(linked_high[2] , linked_high[1] , linked_high): candidateHigh[1]
+
+    var float candidateLow = na
+    candidateLow := low_src[1] < low_src[2] and low_src[1] < low_src ? math.min(linked_low[2] ,linked_low[1] , linked_low) : candidateLow[1]
+    
+    [candidateHigh, candidateLow]
+
+f_mean_cross(mean_src ,o , c ,h ,l) =>
+    var float hh = na
+    var float ll = na
+    var float por = na // point of revarsal
+
+    kalman = k.f_kalman(mean_src,0.1,0.01)
+    condH = c[1] > kalman and c <= kalman or h > kalman and math.pow(o*c , 0.5) < kalman
+    condL = c[1] < kalman and c >= kalman or l < kalman and math.pow(o*c , 0.5) > kalman
+
+    por := condH ?  math.max(h,h[1]) : condL ? math.min(l[1] ,l) : por[1]
+    por
+
+CandleFix(float O , float H , float L , float C ) =>
+    fixnanO = fixnan(O)
+    fixnanH = fixnan(H)
+    fixnanL = fixnan(L)
+    fixnanC = fixnan(C)
+    fixnanV = na(fixnan(volume)) ? 1 : (volume)
+    [fixnanO , fixnanH , fixnanL , fixnanC , fixnanV ]
+
+
+f_4LegRsi(float FO, float FH, float FL, float FC, int length, int smooth) =>
+    o = ta.ema(ta.rsi(FO, length), smooth)
+    h = ta.ema(ta.rsi(math.max(FH,FC[1]), length), smooth)
+    l = ta.ema(ta.rsi(math.min(FL,FC[1]), length), smooth)
+    c = ta.ema(ta.rsi(FC, length), smooth)
+    
+    h := math.max(o, h, l, c)
+    l := math.min(o, h, l, c)
+    
+    // __close = math.avg(o, _high, _low, c)
+    // __open = math.avg(o[1], c[1])
+    // __high = math.max(o, _high, c)
+    // __low = math.min(o, _low, c)
+    
+    [o , h ,l ,c]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DATA SOURCES & RSI CALCS
+// ═══════════════════════════════════════════════════════════════════════════
+[FO , FH , FL , FC , FV] = CandleFix(open , high , low , close)
+
+[__open , __high , __low , __close] = f_4LegRsi(FO , FH , FL , FC , length,smooth)
+
+[delta , cumdelta] = k.f_CumulativeDelta(FO , FH , FL , FC , FV)
+rsi_delta = ta.ema(ta.rsi(cumdelta ,length) , smooth)
+[od , hd , ld , cd , avgd , dird] = k.HeikinAshi(rsi_delta[1] , rsi_delta)
+
+price_AvgRsi = math.avg(__open , __high , __low , __close)
+CombinedRsi =  ( price_AvgRsi - 50) + (rsi_delta - 50)
+
+[src_mx , src_mn ] = k.f_MxMn(__open , __high , __low ,__close)      
+src_mxmn = math.pow(__open*__high*__low*__close , 0.25)
+
+ma_src = f_mean_cross(src_mxmn ,__open,__close ,__high ,__low)
+
+// Map por for the Zone Gravity System
+float por = ma_src
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ZONE GRAVITY SYSTEM — Advanced Fibonacci Attractor Logic
+//  Depends on: ma_src, rsi_delta, por 
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Zone Boundary Definitions ──────────────────────────────────────────────
+var float[] ZONE_BOTTOM = array.from( 0.0, 23.6, 38.2, 50.0, 61.8, 78.6)
+var float[] ZONE_TOP    = array.from(23.6, 38.2, 50.0, 61.8, 78.6,100.0)
+
+int N_ZONES   = 6
+int N_BUCKETS = 4   
+
+// ─── Density State Arrays (flattened N_ZONES × N_BUCKETS = 24 cells) ────────
+var float[] visit_raw   = array.new_float(24, 0.0)  
+var float[] visit_delta = array.new_float(24, 0.0)  
+
+// ─── Per-Zone Gravity State ──────────────────────────────────────────────────
+var float[] gravity_raw  = array.new_float(6, na )  
+var float[] gravity_k    = array.new_float(6, na )  
+var float[] kalman_p     = array.new_float(6, 0.1)  
+var float[] kalman_gain  = array.new_float(6, 1.0)  
+
+// ─── Transition State ────────────────────────────────────────────────────────
+var int prev_zone = -1  
+
+// ════════════════════════════════════════════════════════════════════════════
+//  HELPER FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════
+f_getZone(float v) =>
+    int z = -1
+    if v >= 0.0   and v <  16.666 
+        z := 0
+    else if v >= 16.666  and v <  33.333  
+        z := 1
+    else if v >= 33.333  and v <  49.999  
+        z := 2
+    else if v >= 49.999  and v <  66.666  
+        z := 3
+    else if v >= 66.666  and v <  83.333  
+        z := 4
+    else if v >= 83.333  and v <= 99.999 
+        z := 5
+    z
+
+f_getBucket(float v, int zi) =>
+    float bot  = array.get(ZONE_BOTTOM, zi)
+    float top  = array.get(ZONE_TOP,    zi)
+    float band = (top - bot) / N_BUCKETS
+    int   b    = int(math.floor((v - bot) / band))
+    math.min(b, N_BUCKETS - 1)  
+
+f_bucketCenter(int zi, int bj) =>
+    float bot  = array.get(ZONE_BOTTOM, zi)
+    float top  = array.get(ZONE_TOP,    zi)
+    float band = (top - bot) / N_BUCKETS
+    bot + band * float(bj) + band * 0.5
+
+f_kalmanUpdate(int zi, float new_obs) =>
+    float Q      = 0.005
+    float R      = 0.5
+    float p_prev = array.get(kalman_p,    zi)
+    float p_pred = p_prev + Q
+    float gain   = p_pred / (p_pred + R)
+    float p_new  = (1.0 - gain) * p_pred
+
+    array.set(kalman_p,    zi, p_new)
+    array.set(kalman_gain, zi, gain)           
+
+    float prev_gk = array.get(gravity_k, zi)
+    float gk_new  = na(prev_gk) ? new_obs : prev_gk + gain * (new_obs - prev_gk)
+    array.set(gravity_k, zi, gk_new)
+    gk_new
+
+f_updateGravity(float src, float delta_w) =>
+    int zi = f_getZone(src)
+
+    if zi >= 0
+        int   bj    = f_getBucket(src, zi)
+        int   idx   = zi * N_BUCKETS + bj
+
+        array.set(visit_raw,   idx, array.get(visit_raw,   idx) + 1.0)
+        array.set(visit_delta, idx, array.get(visit_delta, idx) + math.abs(delta_w))
+
+        float best_w  = -1.0
+        int   best_bj = 0
+        for j = 0 to N_BUCKETS - 1
+            float w = array.get(visit_delta, zi * N_BUCKETS + j)
+            if w > best_w
+                best_w  := w
+                best_bj := j
+
+        float raw_g = f_bucketCenter(zi, best_bj)
+        array.set(gravity_raw, zi, raw_g)
+        f_kalmanUpdate(zi, raw_g)
+
+    zi
+
+f_transitionQuality(int curr_z, int prev_z, float src) =>
+    int result = 0
+    if curr_z != prev_z and prev_z >= 0 and curr_z >= 0
+        float grav  = array.get(gravity_k, prev_z)
+        if not na(grav)
+            float bot   = array.get(ZONE_BOTTOM, prev_z)
+            float top   = array.get(ZONE_TOP,    prev_z)
+            float width = top - bot
+            float dist  = math.abs(src - grav)
+            result := dist < width * 0.25 ? 1 : -1
+    result
+
+f_porPressure(float por_val, int zi) =>
+    int state = 0
+    if zi >= 0 and not na(por_val)
+        float grav  = array.get(gravity_k, zi)
+        if not na(grav)
+            float bot       = array.get(ZONE_BOTTOM, zi)
+            float top       = array.get(ZONE_TOP,    zi)
+            float tolerance = (top - bot) * 0.15   
+            if por_val > grav + tolerance
+                state := 1
+            else if por_val < grav - tolerance
+                state := -1
+    state
+
+// ════════════════════════════════════════════════════════════════════════════
+//  EXECUTION
+// ════════════════════════════════════════════════════════════════════════════
+// ─── Exponential Decay Engine ────────────────────────────────────────────────
+
+for i = 0 to 23
+    array.set(visit_raw,   i, array.get(visit_raw,   i) * DECAY_FACTOR)
+    array.set(visit_delta, i, array.get(visit_delta, i) * DECAY_FACTOR)
+
+float delta_w  = rsi_delta - 50.0                         
+int   curr_z   = f_updateGravity(ma_src, delta_w)         
+//int   t_qual   = f_transitionQuality(curr_z, prev_zone, ma_src)
+//int   por_st   = f_porPressure(por, curr_z)               
+
+prev_zone := curr_z
+
+// ─── Gravity Value Extraction ────────────────────────────────────────────────
+float grav_z0 = array.get(gravity_k, 0)   
+float grav_z1 = array.get(gravity_k, 1)   
+float grav_z2 = array.get(gravity_k, 2)   
+float grav_z3 = array.get(gravity_k, 3)   
+float grav_z4 = array.get(gravity_k, 4)   
+float grav_z5 = array.get(gravity_k, 5)   
+
+float conf_z0 = 1.0 - array.get(kalman_gain, 0)
+float conf_z1 = 1.0 - array.get(kalman_gain, 1)
+float conf_z2 = 1.0 - array.get(kalman_gain, 2)
+float conf_z3 = 1.0 - array.get(kalman_gain, 3)
+float conf_z4 = 1.0 - array.get(kalman_gain, 4)
+float conf_z5 = 1.0 - array.get(kalman_gain, 5)
+
+// ─── Pressure State Color ────────────────────────────────────────────────────
+// color press_col = por_st ==  1 ? color.new(color.rgb(255,255,255),    20) :
+//                   por_st == -1 ? color.new(color.rgb(0,0,0),  20) :
+//                                  color.new(color.rgb(128,128,128), 20)
+
+// ─── Zone Transition Signals ─────────────────────────────────────────────────
+// plotshape(t_qual ==  1, title='Qualified Break',
+//   style=shape.triangleup,   location=location.bottom,
+//   color=color.new(color.lime,   0), size=size.small)
+
+// plotshape(t_qual == -1, title='Unqualified Sweep',
+//   style=shape.triangledown, location=location.top,
+//   color=color.new(color.orange, 0), size=size.small)
+
+// ─── Gravity Attractor Plots ─────────────────────────────────────────────────
+plot(grav_z5, title='Attractor 78.6–100',  color=color.rgb(0, 0, 255), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z4, title='Attractor 61.8–78.6', color=color.rgb(0, 128, 255), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z3, title='Attractor 50–61.8',   color=color.new(color.rgb(0,255,0),  0), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z2, title='Attractor 38.2–50',   color=color.new(color.rgb(255,255,0), 0), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z1, title='Attractor 23.6–38.2', color=color.new(color.rgb(255,128,0), 0), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z0, title='Attractor 0–23.6',    color=color.new(color.rgb(255,0,0),    0), linewidth=1 , linestyle = plot.linestyle_dotted)
+
+// ─── Zone Confidence Background ──────────────────────────────────────────────
+// float curr_conf = curr_z >= 0 ? 1.0 - array.get(kalman_gain, curr_z) : na
+// bgcolor(
+//   not na(curr_conf)
+//     ? color.new(press_col, int(90.0 - curr_conf * 60.0))
+//     : na,
+//   title='Zone Confidence')
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ORIGINAL CANDLE LOGIC & PLOTTING
+// ═══════════════════════════════════════════════════════════════════════════
+minLevel = math.min(FC[1], FL)
+guard  = syminfo.mintick
+
+pc = ((math.max((FC -minLevel),guard) - math.max((FO - minLevel), guard)))*100/(math.max(FC[1], FH) - minLevel )
+rsc = ( __close - __open)    
+
+ur = math.sum( rsc >= 0 ?  rsc/pc : 0 , candle_mrk_len)
+ur_ = math.sum( rsc >= 0 ?  1 : 0 , candle_mrk_len )
+ur := (ur == 0 ? 0 : ur_/ur )
+
+dr = math.sum(rsc < 0 ?  (rsc/pc) : 0  , candle_mrk_len)
+dr_ = math.sum(rsc < 0 ?  1 : 0  , candle_mrk_len )
+dr := (dr == 0 ? 0 : dr_/dr )
+
+grater_response = math.abs(ur) > math.abs(dr)
+
+float candle_range = math.max(__high , __close[1]) - math.min(__low , __close[1]) + math.max(hd , cd[1]) - math.min(ld , cd[1])
+max_candle = ta.highest(candle_range , candle_mrk_len ) == candle_range
+CombinedRsiCng = CombinedRsi >= CombinedRsi[1]
+
+color LargeCandle = max_candle  and CombinedRsi <= CombinedRsi[1] ? color.rgb(0,0,255) : max_candle and CombinedRsi > CombinedRsi[1]   ? color.rgb(255,255,0) : na
+
+color RsiUpCandle = max_candle and CombinedRsiCng ? color.rgb (255,255,0) : grater_response ?  color.rgb(0, 255, 0) : color.rgb(0,160,0)
+color RsiDownCandle = max_candle and not CombinedRsiCng? color.rgb (0,0,255) : not grater_response ?  color.rgb(255,0,0)   : color.rgb(160,0,160)
+
+plotcandle(  __open < __close  ? __open : na, __high, __low, __close, title='Rsi Ascending candle', color= RsiUpCandle, bordercolor = color.rgb(0,0,0), wickcolor = RsiUpCandle, editable=true)
+plotcandle(  __open > __close  ? __open : na, __high, __low, __close, title='Rsi Descending candle', color= RsiDownCandle, wickcolor =  RsiDownCandle, bordercolor = color.rgb(0,0,0), editable=true)
+
+barcolor( LargeCandle)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// [INJECTED] STRIKE PRICE DELTA PROFILE
+// Draws on MAIN CHART via force_overlay — zero visual footprint in lower pane
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Strike Profile Inputs ───────────────────────────────────────────────────
+string sdp_exp     = input.string("260415", "Options Expiry YYMMDD",
+  group="Strike Delta Profile",
+  tooltip="TradingView expiry in YYMMDD format. Check any option ticker for the date.")
+int    sdp_atm_in  = input.int(23800, "ATM Strike Price",
+  group="Strike Delta Profile",
+  tooltip="Set to the nearest round strike of current spot. Example: if NIFTY is 23775, enter 23800 (step=50) or 23800 (step=100).")
+int    sdp_span    = input.int(3, "Strikes Each Side", minval=1, maxval=5,
+  group="Strike Delta Profile",
+  tooltip="Smaller span uses fewer request calls. 3 is lighter for free plans; 5 restores the full 11-strike chain.")
+string sdp_reset_mode = input.string("Daily", "Change Base Reset",
+  options=["Daily", "Weekly", "Monthly"], group="Strike Delta Profile",
+  tooltip="Freezes each strike pair's baseline net delta at the first 9:15 session bar of the selected reset period.")
+int    sdp_offset  = input.int(20, "Profile Right Offset (bars)", minval=5, maxval=100,
+  group="Strike Delta Profile")
+int    sdp_width   = input.int(50, "Max Box Width (bars)", minval=10, maxval=200,
+  group="Strike Delta Profile")
+bool   sdp_show    = input.bool(true, "Show Strike Profile",
+  group="Strike Delta Profile")
+bool   sdp_show_diag = input.bool(false, "Show Debug Label",
+  group="Strike Delta Profile")
+
+// ─── Asset Guard ─────────────────────────────────────────────────────────────
+bool sdp_active = syminfo.type == "index" and (syminfo.prefix == "NSE" or syminfo.prefix == "BSE")
+
+// ─── Auto Step Detection (syminfo.root is simple string = no series issue) ──
+// Verified against NSE/BSE exchange specifications:
+// BANKNIFTY: 100 | SENSEX: 100 | BANKEX: 100 | NIFTYNXT50: 100
+// NIFTY: 50     | FINNIFTY: 50
+// MIDCPNIFTY: 25
+int sdp_step = 50
+if str.contains(syminfo.root, "BANKNIFTY")
+    sdp_step := 100
+else if str.contains(syminfo.root, "MIDCPNIFTY")
+    sdp_step := 25
+else if str.contains(syminfo.root, "SENSEX") or str.contains(syminfo.root, "BANKEX") or str.contains(syminfo.root, "NIFTYNXT50")
+    sdp_step := 100
+
+// ─── ATM (constant input.int = exactly 22 unique symbols) ───────────────────
+int sdp_atm = sdp_atm_in
+
+// Fixed row budget. Active requests depend on sdp_span, so lower span = lower request count.
+int SDP_MAX_WING = 5
+int SDP_ROW_COUNT = SDP_MAX_WING * 2 + 1
+
+// ─── Cumulative Net Delta Engine ─────────────────────────────────────────────
+f_sdp_cum_delta() =>
+    float _tw       = math.max(high, close[1]) - math.max(open, close)
+    float _bw       = math.min(open, close)    - math.min(low, close[1])
+    float _body     = math.abs(open - close)
+    float _tw_sq    = _tw * _tw
+    float _bw_sq    = _bw * _bw
+    float _body_sq  = _body * _body
+    float _total_sq = _tw_sq + _bw_sq + _body_sq
+    bool  _bullish  = (_bw + (close - open) - _tw) >= 0
+    float _buy_sh   = _bw_sq + (_bullish     ? _body_sq : 0)
+    float _sell_sh  = _tw_sq + (not _bullish ? _body_sq : 0)
+    float _buy_pct  = _total_sq > 0 ? _buy_sh  / _total_sq : 0.5
+    float _sell_pct = _total_sq > 0 ? _sell_sh / _total_sq : 0.5
+    float _net_tick = nz(volume, 0) * (_buy_pct - _sell_pct)
+    ta.cum(_net_tick)
+
+// ─── Option Root Mapping ────────────────────────────────────────────────────
+// BSE options use abbreviated roots that differ from the index chart name.
+// NSE indices: option root = chart root (NIFTY, BANKNIFTY, etc.)
+// BSE indices: SENSEX→BSX, BANKEX→BKX
+string sdp_opt_root = syminfo.root
+if syminfo.root == "SENSEX"
+    sdp_opt_root := "BSX"
+else if syminfo.root == "BANKEX"
+    sdp_opt_root := "BKX"
+
+// ─── Ticker Construction ────────────────────────────────────────────────────
+// Format: PREFIX:OPT_ROOT + YYMMDD + C/P + STRIKE
+// Example NSE: NSE:NIFTY260415C23800
+// Example BSE: BSE:BSX260409C76600
+f_sdp_tk(int strike, string opt_type) =>
+    syminfo.prefix + ":" + sdp_opt_root + sdp_exp + opt_type + str.tostring(strike)
+
+f_sdp_change_pct(float current_val, float base_val) =>
+    float pct = na
+    if not na(current_val) and not na(base_val) and math.abs(base_val) > 0.000001
+        pct := (current_val - base_val) * 100.0 / math.abs(base_val)
+    pct
+
+f_sdp_change_text(float change_pct) =>
+    na(change_pct) ? "--" : change_pct > 0 ? "+" + str.tostring(change_pct, "#.0") + "%" : change_pct < 0 ? str.tostring(change_pct, "#.0") + "%" : "0.0%"
+
+f_sdp_change_color(float change_pct) =>
+    na(change_pct) ? color.silver : change_pct > 0 ? color.rgb(0, 220, 0) : change_pct < 0 ? color.rgb(230, 40, 40) : color.white
+
+// ─── Drawing Engine ──────────────────────────────────────────────────────────
+var float[] sdp_net_values  = array.new_float(SDP_ROW_COUNT, na)
+var float[] sdp_base_values = array.new_float(SDP_ROW_COUNT, na)
+var box[]   sdp_boxes       = array.new<box>()
+var label[] sdp_stat_labels = array.new<label>()
+var label   sdp_debug_lbl   = na
+var int     sdp_base_anchor_time = na
+
+bool sdp_in_session = timeframe.isintraday ? not na(time(timeframe.period, "0915-1530")) : true
+bool sdp_prev_in_session = bar_index > 0 ? sdp_in_session[1] : false
+bool sdp_session_open = sdp_in_session and not sdp_prev_in_session
+bool sdp_new_week = ta.change(time("W")) != 0
+bool sdp_new_month = ta.change(time("M")) != 0
+
+bool sdp_reset_bar = sdp_session_open
+if sdp_reset_mode == "Weekly"
+    sdp_reset_bar := sdp_session_open and sdp_new_week
+else if sdp_reset_mode == "Monthly"
+    sdp_reset_bar := sdp_session_open and sdp_new_month
+
+if sdp_show and sdp_active
+    for i = 0 to SDP_ROW_COUNT - 1
+        int rel = SDP_MAX_WING - i
+        if math.abs(rel) <= sdp_span
+            int strike = sdp_atm + rel * sdp_step
+            float ce_val = request.security(f_sdp_tk(strike, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+            float pe_val = request.security(f_sdp_tk(strike, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+            float net_val = na(ce_val) and na(pe_val) ? na : nz(ce_val) - nz(pe_val)
+            array.set(sdp_net_values, i, net_val)
+        else
+            array.set(sdp_net_values, i, na)
+
+    if sdp_reset_bar or na(sdp_base_anchor_time)
+        for i = 0 to SDP_ROW_COUNT - 1
+            array.set(sdp_base_values, i, array.get(sdp_net_values, i))
+        sdp_base_anchor_time := time
+
+if barstate.islast
+    if array.size(sdp_boxes) > 0
+        for i = 0 to array.size(sdp_boxes) - 1
+            box.delete(array.get(sdp_boxes, i))
+        array.clear(sdp_boxes)
+
+    if array.size(sdp_stat_labels) > 0
+        for i = 0 to array.size(sdp_stat_labels) - 1
+            label.delete(array.get(sdp_stat_labels, i))
+        array.clear(sdp_stat_labels)
+
+    if sdp_show and sdp_active
+        float sdp_max = 0.0
+        float min_net = na
+        float max_net = na
+        for i = 0 to SDP_ROW_COUNT - 1
+            float val = array.get(sdp_net_values, i)
+            if not na(val)
+                float abs_val = math.abs(val)
+                sdp_max := math.max(sdp_max, abs_val)
+                min_net := na(min_net) ? val : math.min(min_net, val)
+                max_net := na(max_net) ? val : math.max(max_net, val)
+
+        int   sdp_x1 = bar_index + sdp_offset
+        float step_f = float(sdp_step)
+
+        for i = 0 to SDP_ROW_COUNT - 1
+            int rel = SDP_MAX_WING - i
+            if math.abs(rel) <= sdp_span
+                int strike = sdp_atm + rel * sdp_step
+                float strike_lvl = float(strike)
+                float val = array.get(sdp_net_values, i)
+                float base_val = array.get(sdp_base_values, i)
+                float change_pct = f_sdp_change_pct(val, base_val)
+                float width_pct = sdp_max > 0 and not na(val) ? math.abs(val) / sdp_max : 0.0
+                int sdp_box_width = na(val) ? 10 : math.max(10, int(math.round(sdp_width * width_pct)))
+                int sdp_x2 = sdp_x1 + sdp_box_width
+
+                color clr = na(val) or na(min_net) or na(max_net) or min_net == max_net
+                  ? color.rgb(120, 120, 120)
+                  : color.from_gradient(val, min_net, max_net, color.rgb(230, 0, 0), color.rgb(0, 230, 0))
+
+                int alpha = na(val) ? 82 : math.max(10, int(math.round(75 - (65 * width_pct))))
+                color bg  = color.new(clr, alpha)
+                color brd = clr
+
+                box bx = box.new(sdp_x1, strike_lvl + (step_f * 0.30),
+                                 sdp_x2, strike_lvl - (step_f * 0.30),
+                                 bgcolor=bg, border_color=brd, xloc=xloc.bar_index,
+                                 text=str.tostring(strike), text_color=color.black,
+                                 text_size=size.normal, text_halign=text.align_center,
+                                 text_valign=text.align_center, force_overlay=true)
+                array.push(sdp_boxes, bx)
+
+                label stat_lbl = label.new(sdp_x2 + 1, strike_lvl, f_sdp_change_text(change_pct),
+                  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left,
+                  color=color.new(color.black, 0), textcolor=f_sdp_change_color(change_pct),
+                  size=size.large, force_overlay=true)
+                array.push(sdp_stat_labels, stat_lbl)
+
+        if sdp_show_diag
+            int spot_atm = int(math.round(close / float(sdp_step)) * float(sdp_step))
+            float atm_net = array.get(sdp_net_values, SDP_MAX_WING)
+            float atm_base = array.get(sdp_base_values, SDP_MAX_WING)
+            float atm_change = f_sdp_change_pct(atm_net, atm_base)
+            string diag_txt = "═══ SDP DIAG ═══" +
+             "\nRoot: " + syminfo.root + " | Step: " + str.tostring(sdp_step) +
+             "\nATM input: " + str.tostring(sdp_atm) +
+             "\nSpot: " + str.tostring(close) + " → Suggested ATM: " + str.tostring(spot_atm) +
+             "\nSpan: ±" + str.tostring(sdp_span) + " strikes | Reset: " + sdp_reset_mode +
+             "\nATM Net: " + str.tostring(atm_net, "#.##") +
+             "\nATM Base: " + str.tostring(atm_base, "#.##") +
+             "\nATM Change: " + f_sdp_change_text(atm_change)
+            if na(sdp_debug_lbl)
+                sdp_debug_lbl := label.new(bar_index + 5, close, diag_txt,
+                  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left,
+                  color=color.new(color.black, 20), textcolor=color.white, size=size.normal,
+                  force_overlay=true)
+            else
+                label.set_xy(sdp_debug_lbl, bar_index + 5, close)
+                label.set_text(sdp_debug_lbl, diag_txt)
+        else if not na(sdp_debug_lbl)
+            label.delete(sdp_debug_lbl)
+            sdp_debug_lbl := na
+    else if not na(sdp_debug_lbl)
+        label.delete(sdp_debug_lbl)
+        sdp_debug_lbl := na

@@ -1,0 +1,4 @@
+0000000000000000000000000000000000000000 0554413b1feff92440b87e9c3af26f228eec81a8 Kesabmajhi <iamkesab@gmail.com> 1772478710 +0530	branch: Created from HEAD
+0554413b1feff92440b87e9c3af26f228eec81a8 9e9fd84440ee844c016496da08029f609903df10 Kesabmajhi <iamkesab@gmail.com> 1772479249 +0530	commit: feat: sync updated backend-frozen-v1 project files from local desktop snapshot
+9e9fd84440ee844c016496da08029f609903df10 cc84b4997877f12733cb0ea3c57bedcfec0ecca6 Kesabmajhi <iamkesab@gmail.com> 1772479292 +0530	commit (amend): Backend frozen after invariance + shock validation
+cc84b4997877f12733cb0ea3c57bedcfec0ecca6 606f9e967642caee887e0486d8d8ae8beacb4ed1 Kesabmajhi <iamkesab@gmail.com> 1772486936 +0530	commit: refactor: final backend structure update with app.py and cleaned workspace
