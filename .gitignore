@@ -1,0 +1,15 @@
+# Bytecode and backups
+*.bak
+*.tmp
+
+# Logging & Data
+pinescript-dev/log\ csv/
+*.csv
+*.log
+
+# Visualization & Local Tools
+pinescript-dev/graphify-out/
+.DS_Store
+
+# Git
+.git/
