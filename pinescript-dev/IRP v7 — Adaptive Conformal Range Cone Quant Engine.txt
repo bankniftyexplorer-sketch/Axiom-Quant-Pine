@@ -1,0 +1,1112 @@
+//@version=6
+// ================================================================
+// IRP v7 — Adaptive Conformal Range Cone Quant Engine
+// Locked-at-open predicted range with adaptive walk-forward
+// conformal calibration, asymmetric remaining cone, calibrated
+// breach risk, regime classification, model confidence, and
+// diagnostic logging.
+// ================================================================
+// Operational thresholds for breach_prob (informational - not enforced):
+//   < 50  : safe
+//   50-69 : monitor
+//   70-81 : warn - consider hedge
+//   >= 82 : act  - exit naked short premium / roll strikes
+//   95    : hard cap (do not infer extra information beyond 95)
+//
+// ===== Operating Notes =====
+// 1. Allow >= 20 sessions of warmup per new symbol before trusting calibration.
+//    Sessions 0-19  : pure preset.
+//    Sessions 20-39 : blended preset/adaptive.
+//    Sessions 40+   : pure adaptive.
+// 2. Validate across NORMAL, TREND, PRESSURE, and BREACH days before live use.
+// 3. Suggested options-selling rules of thumb (informational, not signals):
+//    - Reduce / hedge when breach_prob > 70 AND consumed_pct > 70.
+//    - Exit naked short premium when breach_prob >= 82.
+// 4. Re-export log.csv weekly. Track realized containment vs target_containment.
+//    Re-tune preset only after >= 60 sessions of drift exceeding +/- 5%.
+// 5. A single breach day is not a failure - a probabilistic cone is expected
+//    to be overrun on tail events at roughly (1 - target_containment) frequency.
+indicator('IRP v7 [Adaptive Conformal Range Cone]', overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ================================================================
+// INPUTS
+// ================================================================
+i_bpv  = input.int(10,  'BPV Window (daily bars)',   minval=5,   maxval=30,  group='Engine')
+i_ols  = input.int(126, 'OLS Window (trading days)', minval=60,  maxval=252, group='Engine')
+i_sv   = input.int(60,  'Semivariance Window',       minval=30,  maxval=120, group='Engine')
+i_rs_s = input.int(20,  'Hurst Short N',             minval=10,  maxval=40,  group='Engine')
+i_rs_l = input.int(60,  'Hurst Long N',              minval=40,  maxval=120, group='Engine')
+i_sess = input.int(375, 'Session Minutes',           minval=60,  maxval=1440, group='Engine', tooltip='NSE=375, NYSE=390, Crypto=1440')
+i_dir  = input.bool(true, 'Empirical Diurnal', group='Engine', tooltip='NSE diurnal variance buckets are applied only to eligible NSE index symbols.')
+
+i_sigma  = input.float(1.0, 'Base Sigma Level', minval=0.5, maxval=3.0, step=0.25, group='Range', tooltip='Base sigma applied before conformal calibration. Final locked range = raw range × directional conformal calibration.')
+i_sigma2 = input.float(0.0, 'Secondary Sigma (0=off)', minval=0.0, maxval=3.0, step=0.25, group='Range', tooltip='Optional second band placeholder. Set 0 to disable.')
+i_react  = input.float(0.4, 'Daily Reactivity', minval=0.0, maxval=1.0, step=0.1, group='Range', tooltip='0=pure HAR (smooth), 0.4=balanced, 1.0=fully reactive to yesterday. Controls day-to-day width variation.')
+i_rcap   = input.float(2.0, 'Reactivity Cap', minval=1.0, maxval=4.0, step=0.25, group='Range', tooltip='Caps the daily reactivity multiplier symmetrically around 1.0 to prevent extreme post-shock distortions.')
+i_vix    = input.bool(true, 'India VIX Overlay', group='Range', tooltip='Scales predicted range using IV-RV spread from India VIX. Only works on eligible NSE index symbols.')
+i_vix_wt = input.float(0.5, 'VIX Blend Weight', minval=0.0, maxval=1.0, step=0.1, group='Range', tooltip='0=ignore VIX, 0.5=equal blend of RV and IV, 1.0=fully trust VIX over HAR.')
+
+i_adapt_cal = input.bool(true, 'Adaptive Conformal Calibration', group='Calibration')
+i_cal_len   = input.int(60, 'Calibration Sessions', minval=20, maxval=250, group='Calibration')
+i_target    = input.float(0.72, 'Target Containment', minval=0.50, maxval=0.95, step=0.01, group='Calibration')
+i_decay     = input.float(0.985, 'Calibration Decay', minval=0.95, maxval=1.0, step=0.005, group='Calibration', tooltip='Recent sessions receive more weight in the adaptive conformal calibration.')
+
+i_cone       = input.bool(true,  'Dynamic Range Cone',                group='Display', tooltip='Time-progressive narrowing bands showing remaining expected move. The critical visual for options theta context.')
+i_strikes    = input.bool(true,  'Strike Markers',                    group='Display')
+i_strike_ovr = input.int(0,      'Strike Interval Override (0=auto)', minval=0, maxval=500, group='Display', tooltip='Auto: NIFTY=50, BANKNIFTY=100, FINNIFTY=50, MIDCPNIFTY=25, SENSEX=100, BANKEX=100')
+i_cons       = input.bool(true,  'Consumption Fill',                  group='Display')
+i_tbl        = input.bool(true,  'Model State Table',                 group='Display')
+i_anch       = input.bool(true,  'Anchor Line',                       group='Display')
+i_wlabel     = input.bool(true,  'Width Labels',                      group='Display')
+i_log        = input.bool(false, 'CSV Diagnostic Log',                group='Display')
+
+// ================================================================
+// SYMBOL PRIORS + HELPERS
+// ================================================================
+f_symbol_key() =>
+    string tk = syminfo.ticker
+    string key = 'GENERIC'
+    if tk == 'NIFTY'
+        key := 'NIFTY'
+    else if tk == 'BANKNIFTY'
+        key := 'BANKNIFTY'
+    else if tk == 'SENSEX'
+        key := 'SENSEX'
+    else if tk == 'CNXFINANCE' or tk == 'FINNIFTY'
+        key := 'CNXFINANCE'
+    else if tk == 'NIFTYJR' or tk == 'NIFTYNXT50'
+        key := 'NIFTYJR'
+    else if str.contains(tk, 'BTCUSDT')
+        key := 'BTCUSDT'
+    key
+
+f_preset_sigma(string sym) =>
+    float sig = 1.75
+    if sym == 'NIFTY'
+        sig := 1.57
+    else if sym == 'BANKNIFTY'
+        sig := 1.80
+    else if sym == 'SENSEX'
+        sig := 1.85
+    else if sym == 'CNXFINANCE'
+        sig := 1.65
+    else if sym == 'NIFTYJR'
+        sig := 1.70
+    else if sym == 'BTCUSDT'
+        sig := 2.22
+    sig
+
+f_preset_breach(string sym) =>
+    float risk = 35.00
+    if sym == 'NIFTY'
+        risk := 34.27
+    else if sym == 'BANKNIFTY'
+        risk := 35.73
+    else if sym == 'SENSEX'
+        risk := 40.24
+    else if sym == 'CNXFINANCE'
+        risk := 37.80
+    else if sym == 'NIFTYJR'
+        risk := 39.15
+    else if sym == 'BTCUSDT'
+        risk := 28.95
+    risk
+
+f_is_nse_index() =>
+    string tk = syminfo.ticker
+    str.contains(syminfo.prefix, 'NSE') and (
+         tk == 'NIFTY' or tk == 'BANKNIFTY' or tk == 'FINNIFTY' or tk == 'CNXFINANCE' or
+         tk == 'MIDCPNIFTY' or tk == 'NIFTYNXT50' or tk == 'NIFTYJR')
+
+f_strike_int() =>
+    string tk = syminfo.ticker
+    int step = 50
+    if tk == 'BANKNIFTY'
+        step := 100
+    else if tk == 'NIFTYJR' or tk == 'NIFTYNXT50'
+        step := 100
+    else if tk == 'MIDCPNIFTY'
+        step := 25
+    else if tk == 'SENSEX'
+        step := 100
+    else if tk == 'BANKEX'
+        step := 100
+    step
+
+f_arr_get_float(float[] src, int idx, float fallback) =>
+    idx >= 0 and idx < array.size(src) ? array.get(src, idx) : fallback
+
+f_arr_get_int(int[] src, int idx, int fallback) =>
+    idx >= 0 and idx < array.size(src) ? array.get(src, idx) : fallback
+
+f_mat_get(matrix<float> src, int row, int col, float fallback) =>
+    int rows = matrix.rows(src)
+    int cols = matrix.columns(src)
+    row >= 0 and row < rows and col >= 0 and col < cols ? matrix.get(src, row, col) : fallback
+
+f_mat_scalar_mul(matrix<float> src, float k) =>
+    int rows = matrix.rows(src)
+    int cols = matrix.columns(src)
+    matrix<float> out = matrix.new<float>(rows, cols, 0.0)
+    for r = 0 to rows - 1
+        for c = 0 to cols - 1
+            matrix.set(out, r, c, f_mat_get(src, r, c, 0.0) * k)
+    out
+
+f_mat_add(matrix<float> a, matrix<float> b) =>
+    int rows = matrix.rows(a)
+    int cols = matrix.columns(a)
+    matrix<float> out = matrix.new<float>(rows, cols, 0.0)
+    for r = 0 to rows - 1
+        for c = 0 to cols - 1
+            matrix.set(out, r, c, f_mat_get(a, r, c, 0.0) + f_mat_get(b, r, c, 0.0))
+    out
+
+f_mat_identity(int n) =>
+    matrix<float> out = matrix.new<float>(n, n, 0.0)
+    for i = 0 to n - 1
+        matrix.set(out, i, i, 1.0)
+    out
+
+f_cal_alpha(string regime) =>
+    regime == 'PRESSURE' or regime == 'BREACH' ? 0.25 : regime == 'TRENDING' ? 0.15 : 0.05
+
+f_cal_warmup_blend(float preset, float adaptive, int cal_sessions) =>
+    if cal_sessions < 20
+        preset
+    else if cal_sessions < 40
+        float w = (cal_sessions - 20) / 20.0
+        preset * (1.0 - w) + adaptive * w
+    else
+        adaptive
+
+f_cal_clamps(string sym) =>
+    float lo_clamp = 0.85
+    float hi_clamp = 1.80
+    if sym == 'BANKNIFTY'
+        lo_clamp := 0.90
+        hi_clamp := 2.00
+    else if sym == 'BTCUSDT'
+        lo_clamp := 0.95
+        hi_clamp := 2.50
+    [lo_clamp, hi_clamp]
+
+f_regime_severity(string regime) =>
+    regime == 'BREACH' ? 4 : regime == 'PRESSURE' ? 3 : regime == 'TRENDING' ? 2 : regime == 'DAILY' ? 0 : 1
+
+f_quantile(float[] src, float q, float fallback) =>
+    int n = array.size(src)
+    if n == 0
+        fallback
+    else
+        float[] tmp = array.copy(src)
+        array.sort(tmp, order.ascending)
+        int idx = math.max(0, math.min(n - 1, int(math.ceil(math.max(math.min(q, 1.0), 0.0) * n)) - 1))
+        f_arr_get_float(tmp, idx, fallback)
+
+f_weighted_quantile(float[] src, float q, float fallback, float decay) =>
+    int n = array.size(src)
+    if n == 0
+        fallback
+    else if n == 1
+        f_arr_get_float(src, 0, fallback)
+    else
+        float[] vals = array.copy(src)
+        float[] wts = array.new_float(n, 0.0)
+        for i = 0 to n - 1
+            array.set(wts, i, math.pow(decay, n - 1 - i))
+        for i = 1 to n - 1
+            float key_val = f_arr_get_float(vals, i, fallback)
+            float key_wt  = f_arr_get_float(wts, i, 0.0)
+            int j = i - 1
+            while j >= 0 and f_arr_get_float(vals, j, key_val) > key_val
+                array.set(vals, j + 1, f_arr_get_float(vals, j, key_val))
+                array.set(wts,  j + 1, f_arr_get_float(wts, j, 0.0))
+                j -= 1
+            array.set(vals, j + 1, key_val)
+            array.set(wts,  j + 1, key_wt)
+        float total_w = 0.0
+        for i = 0 to n - 1
+            total_w += f_arr_get_float(wts, i, 0.0)
+        float thresh = total_w * math.max(math.min(q, 1.0), 0.0)
+        float run_w = 0.0
+        float out = f_arr_get_float(vals, n - 1, fallback)
+        for i = 0 to n - 1
+            run_w += f_arr_get_float(wts, i, 0.0)
+            if run_w >= thresh
+                out := f_arr_get_float(vals, i, fallback)
+                break
+        out
+
+string _symbol_key = f_symbol_key()
+bool _recognized_symbol = _symbol_key != 'GENERIC'
+bool _is_nse = str.contains(syminfo.prefix, 'NSE')
+bool _is_nse_index = f_is_nse_index()
+float _preset_sigma = f_preset_sigma(_symbol_key)
+float _preset_breach = f_preset_breach(_symbol_key)
+int _strike_int = i_strike_ovr > 0 ? i_strike_ovr : f_strike_int()
+
+// ================================================================
+// F2: BIPOWER VARIATION + JUMP DETECTION  [BNS 2004]
+//
+// BPV  = (π/2) / (n-1) × Σ |r_i| × |r_{i+1}|   close-to-close
+// RV   = (1/n) × Σ r_i²                          realized variance
+//
+// Continuous fraction = min(BPV / RV, 1.0)
+// Jump flag: jump component exceeds 25% of total variance
+// ================================================================
+f_bpv(simple int n) =>
+    float rv = 0.0
+    for i = 0 to n - 1
+        float r = math.log(math.max(close[i], 1e-9) / math.max(close[i + 1], 1e-9))
+        rv += r * r
+    rv /= n
+    float bs = 0.0
+    for i = 0 to n - 2
+        float a = math.abs(math.log(math.max(close[i],     1e-9) / math.max(close[i + 1], 1e-9)))
+        float b = math.abs(math.log(math.max(close[i + 1], 1e-9) / math.max(close[i + 2], 1e-9)))
+        bs += a * b
+    float bpv = math.pi * 0.5 * bs / math.max(n - 1, 1)
+    float cf  = math.min(bpv / math.max(rv, 1e-10), 1.0)
+    float jv  = math.max(rv - bpv, 0.0)
+    float jfl = rv > 1e-10 and (jv / rv) > 0.25 ? 1.0 : 0.0
+    [cf, jv, jfl]
+
+// ================================================================
+// F3: R/S STATISTIC  [Hurst 1951]
+// ================================================================
+f_rs(simple int N) =>
+    float mu = 0.0
+    for i = 0 to N - 1
+        mu += math.log(math.max(close[i], 1e-9) / math.max(close[i + 1], 1e-9))
+    mu /= N
+    float cm = 0.0, hi = -1e18, lo = 1e18, ss = 0.0
+    for i = 0 to N - 1
+        float r = math.log(math.max(close[i], 1e-9) / math.max(close[i + 1], 1e-9))
+        cm += r - mu
+        hi := math.max(hi, cm)
+        lo := math.min(lo, cm)
+        ss += (r - mu) * (r - mu)
+    float S = math.sqrt(ss / math.max(N - 1, 1))
+    S > 1e-10 ? (hi - lo) / S : math.sqrt(float(N) * math.pi * 0.5)
+
+// ================================================================
+// F4: HURST EXPONENT  [Hurst 1951; Mandelbrot & Wallis 1969]
+// ================================================================
+f_hurst(simple int ns, simple int nl) =>
+    float lrs = math.log(math.max(f_rs(nl), 1e-9)) - math.log(math.max(f_rs(ns), 1e-9))
+    float lns = math.max(math.log(float(nl)) - math.log(float(ns)), 1e-9)
+    math.max(0.35, math.min(0.65, lrs / lns))
+
+// ================================================================
+// F5: NORMALIZED SEMIVARIANCE SCALARS  [BNS et al 2010]
+// ================================================================
+f_sv(simple int n) =>
+    float rp = 0.0, rn = 0.0
+    for i = 0 to n - 1
+        float r = math.log(math.max(close[i], 1e-9) / math.max(close[i + 1], 1e-9))
+        if r > 0.0
+            rp += r * r
+        else
+            rn += r * r
+    rp /= n
+    rn /= n
+    float rt = rp + rn
+    [rt > 1e-12 ? math.sqrt(rp / (rt * 0.5)) : 1.0,
+     rt > 1e-12 ? math.sqrt(rn / (rt * 0.5)) : 1.0]
+
+// ================================================================
+// F6: ROLLING OLS HAR-RV  [Corsi 2009 + Ridge OLS]
+// ================================================================
+f_har(float rv_d, float rv_w, float rv_m, simple int on) =>
+    var float _har_b0_lkg = 1e-7
+    var float[] _har_beta_lkg = array.from(0.36, 0.28, 0.28)
+    matrix<float> A = matrix.new<float>(4, 4, 0.0)
+    matrix<float> C = matrix.new<float>(4, 1, 0.0)
+    int vn = 0
+    for i = 1 to on
+        float x1 = rv_d[i]
+        float x2 = rv_w[i]
+        float x3 = rv_m[i]
+        float y  = rv_d[i - 1]
+        if not (na(x1) or na(x2) or na(x3) or na(y))
+            matrix.set(A, 0, 0, matrix.get(A, 0, 0) + 1.0)
+            matrix.set(A, 0, 1, matrix.get(A, 0, 1) + x1)
+            matrix.set(A, 0, 2, matrix.get(A, 0, 2) + x2)
+            matrix.set(A, 0, 3, matrix.get(A, 0, 3) + x3)
+            matrix.set(A, 1, 0, matrix.get(A, 1, 0) + x1)
+            matrix.set(A, 1, 1, matrix.get(A, 1, 1) + x1 * x1)
+            matrix.set(A, 1, 2, matrix.get(A, 1, 2) + x1 * x2)
+            matrix.set(A, 1, 3, matrix.get(A, 1, 3) + x1 * x3)
+            matrix.set(A, 2, 0, matrix.get(A, 2, 0) + x2)
+            matrix.set(A, 2, 1, matrix.get(A, 2, 1) + x2 * x1)
+            matrix.set(A, 2, 2, matrix.get(A, 2, 2) + x2 * x2)
+            matrix.set(A, 2, 3, matrix.get(A, 2, 3) + x2 * x3)
+            matrix.set(A, 3, 0, matrix.get(A, 3, 0) + x3)
+            matrix.set(A, 3, 1, matrix.get(A, 3, 1) + x3 * x1)
+            matrix.set(A, 3, 2, matrix.get(A, 3, 2) + x3 * x2)
+            matrix.set(A, 3, 3, matrix.get(A, 3, 3) + x3 * x3)
+            matrix.set(C, 0, 0, matrix.get(C, 0, 0) + y)
+            matrix.set(C, 1, 0, matrix.get(C, 1, 0) + x1 * y)
+            matrix.set(C, 2, 0, matrix.get(C, 2, 0) + x2 * y)
+            matrix.set(C, 3, 0, matrix.get(C, 3, 0) + x3 * y)
+            vn += 1
+    float bd = f_arr_get_float(_har_beta_lkg, 0, 0.36)
+    float bw = f_arr_get_float(_har_beta_lkg, 1, 0.28)
+    float bm = f_arr_get_float(_har_beta_lkg, 2, 0.28)
+    float fc = math.max(_har_b0_lkg + bd * rv_d + bw * rv_w + bm * rv_m, 1e-10)
+    float ridge_lambda_used = 1e-8
+    float har_fallback_used = 0.0
+    if vn >= 30
+        float tr = 0.0
+        for i = 0 to 3
+            tr += f_mat_get(A, i, i, 0.0)
+        ridge_lambda_used := math.max(1e-6 * tr / 4.0, 1e-8)
+        matrix<float> A_reg = f_mat_add(A, f_mat_scalar_mul(f_mat_identity(4), ridge_lambda_used))
+        float det_reg = math.abs(matrix.det(A_reg))
+        if na(det_reg) or det_reg < 1e-10
+            har_fallback_used := 1.0
+        else
+            matrix<float> B = matrix.mult(matrix.inv(A_reg), C)
+            float b0 = f_mat_get(B, 0, 0, na)
+            float bd_raw = f_mat_get(B, 1, 0, na)
+            float bw_raw = f_mat_get(B, 2, 0, na)
+            float bm_raw = f_mat_get(B, 3, 0, na)
+            if not na(b0) and not na(bd_raw) and not na(bw_raw) and not na(bm_raw)
+                bd := math.max(bd_raw, 0.0)
+                bw := math.max(bw_raw, 0.0)
+                bm := math.max(bm_raw, 0.0)
+                _har_b0_lkg := b0
+                array.set(_har_beta_lkg, 0, bd)
+                array.set(_har_beta_lkg, 1, bw)
+                array.set(_har_beta_lkg, 2, bm)
+                fc := math.max(b0 + bd * rv_d + bw * rv_w + bm * rv_m, 1e-10)
+            else
+                har_fallback_used := 1.0
+    [fc, bd, bw, bm, ridge_lambda_used, har_fallback_used]
+
+// ================================================================
+// DAILY BUNDLE — evaluated entirely in D context
+// ================================================================
+bool _htf = timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly
+f_daily() =>
+    float _lhc_d = math.log(math.max(high,  1e-9) / math.max(close, 1e-9))
+    float _llc_d = math.log(math.max(low,   1e-9) / math.max(close, 1e-9))
+    float _lho_d = math.log(math.max(high,  1e-9) / math.max(open,  1e-9))
+    float _llo_d = math.log(math.max(low,   1e-9) / math.max(open,  1e-9))
+    float rv_d   = math.max(_lhc_d * _lho_d + _llc_d * _llo_d, 1e-10)
+    [cf, jv, jfl] = f_bpv(i_bpv)
+    float rv_w = ta.sma(rv_d, 5)
+    float rv_m = ta.sma(rv_d, 22)
+    [hv, bd, bw, bm, ridge_lambda_used, har_fallback_used] = f_har(rv_d, rv_w, rv_m, i_ols)
+    float H = f_hurst(i_rs_s, i_rs_l)
+    [us, ls] = f_sv(i_sv)
+    float vov = ta.stdev(math.sqrt(hv * 252.0), 22) / math.sqrt(252.0)
+    float vov_med = ta.median(vov, 22)
+    float anchor = _htf ? close[1] : close
+    float avg_range = ta.sma(high - low, 22)
+    [hv, H, us, ls, vov, vov_med, anchor, jv, jfl, bd, bw, bm, rv_m, avg_range, ridge_lambda_used, har_fallback_used]
+
+[_hv, _H, _us, _ls, _vov, _vov_med, _anch, _jv, _jfl, _bd, _bw, _bm, _rv_m, _avg_range, _ridge_lambda, _har_fallback_flag] =
+ request.security(syminfo.tickerid, 'D', f_daily(), lookahead=barmerge.lookahead_off)
+
+// ================================================================
+// DAILY REACTIVITY LAYER
+// ================================================================
+f_daily_react() =>
+    float _lhc_d = math.log(math.max(high,  1e-9) / math.max(close, 1e-9))
+    float _llc_d = math.log(math.max(low,   1e-9) / math.max(close, 1e-9))
+    float _lho_d = math.log(math.max(high,  1e-9) / math.max(open,  1e-9))
+    float _llo_d = math.log(math.max(low,   1e-9) / math.max(open,  1e-9))
+    float rv_d = math.max(_lhc_d * _lho_d + _llc_d * _llo_d, 1e-10)
+    float rv_w = ta.sma(rv_d, 5)
+    float rv_m = ta.sma(rv_d, 22)
+    [hv, _, _, _, _, _] = f_har(rv_d, rv_w, rv_m, i_ols)
+    float rv_ref = _htf ? rv_d[1] : rv_d
+    float hv_ref = _htf ? hv[2] : hv[1]
+    float ratio = not na(rv_ref) and not na(hv_ref) ? rv_ref / math.max(hv_ref, 1e-10) : 1.0
+    [rv_ref, hv_ref, ratio]
+
+[_rv_react, _hv_react_ref, _react_ratio_raw] =
+ request.security(syminfo.tickerid, 'D', f_daily_react(), lookahead=barmerge.lookahead_off)
+
+// ================================================================
+// INDIA VIX — eligible NSE index symbols only
+// ================================================================
+bool _use_vix = _is_nse_index and i_vix
+float _vix_raw = _use_vix ? request.security('NSE:INDIAVIX', 'D', close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true) : na
+float _vix_daily_var = not na(_vix_raw) ? math.pow(_vix_raw / 100.0, 2) / 252.0 : na
+float _iv_rv_ratio = not na(_vix_daily_var) and _hv > 1e-12 ? _vix_daily_var / _hv : 1.0
+float _iv_rv_factor = math.pow(_iv_rv_ratio, i_vix_wt)
+_iv_rv_factor := math.max(0.5, math.min(2.5, _iv_rv_factor))
+
+float _react_lo = 1.0 / math.max(i_rcap, 1.0)
+float _react_clamped = math.min(math.max(nz(_react_ratio_raw, 1.0), _react_lo), i_rcap)
+float _react_ratio = 1.0 + (_react_clamped - 1.0) * i_react
+float _hv_eff = math.max(_hv * _react_ratio * (_use_vix ? _iv_rv_factor : 1.0), 1e-10)
+
+// ================================================================
+// EMPIRICAL DIURNAL NORMALIZATION  [NSE index intraday only]
+// ================================================================
+bool _intra = not (timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly)
+bool _use_nse_diurnal = i_dir and _intra and _is_nse_index
+var float[] _dsum = array.new_float(7, 0.0)
+var int[] _dcnt = array.new_int(7, 0)
+
+f_bucket() =>
+    int h = hour(time, 'Asia/Kolkata')
+    h >= 9 and h <= 15 ? h - 9 : -1
+
+if _use_nse_diurnal and not na(close[1])
+    int bk = f_bucket()
+    if bk >= 0 and bk < array.size(_dsum) and bk < array.size(_dcnt)
+        float _dr = session.isfirstbar ? math.log(math.max(close, 1e-9) / math.max(open, 1e-9)) : math.log(math.max(close, 1e-9) / math.max(close[1], 1e-9))
+        float sq = _dr * _dr
+        array.set(_dsum, bk, f_arr_get_float(_dsum, bk, 0.0) + sq)
+        array.set(_dcnt, bk, f_arr_get_int(_dcnt, bk, 0) + 1)
+
+float _df = 1.0
+if _use_nse_diurnal
+    int bk = f_bucket()
+    int _bk_cnt = f_arr_get_int(_dcnt, bk, 0)
+    if bk >= 0 and bk < array.size(_dsum) and bk < array.size(_dcnt) and _bk_cnt >= 10
+        float tot = array.sum(_dsum)
+        int tcn = 0
+        for j = 0 to 6
+            tcn += f_arr_get_int(_dcnt, j, 0)
+        if tcn > 0
+            float ovr = tot / tcn
+            float bkt_mn = f_arr_get_float(_dsum, bk, 0.0) / _bk_cnt
+            _df := ovr > 1e-12 ? bkt_mn / ovr : 1.0
+
+// ================================================================
+// ADAPTIVE CONFORMAL CALIBRATION STATE
+// ================================================================
+var float _pred_hi = na
+var float _pred_lo = na
+var float _pred_anch = na
+var float _pred_width = na
+var float _us_norm_p = 1.0
+var float _ls_norm_p = 1.0
+var float _base_move_lock = na
+var float _raw_up_ref = na
+var float _raw_dn_ref = na
+var float _cal_up_lock = na
+var float _cal_dn_lock = na
+var int _cal_sessions_lock = 0
+var float _prev_cons = 0.0
+var float[] _up_ratio_hist = array.new_float(0)
+var float[] _dn_ratio_hist = array.new_float(0)
+var float _cal_up_state = na
+var float _cal_dn_state = na
+var float _cal_alpha_effective = 0.05
+
+if na(_cal_up_state)
+    _cal_up_state := _preset_sigma
+if na(_cal_dn_state)
+    _cal_dn_state := _preset_sigma
+
+while array.size(_up_ratio_hist) > i_cal_len
+    array.shift(_up_ratio_hist)
+while array.size(_dn_ratio_hist) > i_cal_len
+    array.shift(_dn_ratio_hist)
+
+int _cal_sessions = int(math.min(array.size(_up_ratio_hist), array.size(_dn_ratio_hist)))
+float _conf_up = f_weighted_quantile(_up_ratio_hist, i_target, _preset_sigma, i_decay)
+float _conf_dn = f_weighted_quantile(_dn_ratio_hist, i_target, _preset_sigma, i_decay)
+[_cal_lo_clamp, _cal_hi_clamp] = f_cal_clamps(_symbol_key)
+float _adaptive_cal_up = math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, nz(_cal_up_state, _preset_sigma)))
+float _adaptive_cal_dn = math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, nz(_cal_dn_state, _preset_sigma)))
+float _next_cal_up = i_adapt_cal ? f_cal_warmup_blend(_preset_sigma, _adaptive_cal_up, _cal_sessions) : _preset_sigma
+float _next_cal_dn = i_adapt_cal ? f_cal_warmup_blend(_preset_sigma, _adaptive_cal_dn, _cal_sessions) : _preset_sigma
+float _eff_sigma = i_sigma
+
+float _base_move_live = na
+float _raw_up_live = na
+float _raw_dn_live = na
+
+// ================================================================
+// PREDICTED RANGE — LOCKED AT SESSION OPEN
+// ================================================================
+if _intra and session.isfirstbar
+    float _gap_pct = _anch > 0 ? math.abs(open - _anch) / _anch * 100.0 : 0.0
+    _pred_anch := _gap_pct > 0.3 ? open : _anch
+    float _var_ratio = _rv_m > 1e-12 ? math.sqrt(math.max(_hv_eff, 1e-10) / _rv_m) : 1.0
+    float _us_norm = _us / math.max((_us + _ls) * 0.5, 1e-6)
+    float _ls_norm = _ls / math.max((_us + _ls) * 0.5, 1e-6)
+    _us_norm_p := _us_norm
+    _ls_norm_p := _ls_norm
+    _base_move_lock := nz(_avg_range, _pred_anch * math.sqrt(math.max(_hv_eff, 1e-10)) * 2.0) * 0.5 * _var_ratio * _eff_sigma
+    _cal_up_lock := _next_cal_up
+    _cal_dn_lock := _next_cal_dn
+    _cal_sessions_lock := _cal_sessions
+    _raw_up_ref := _base_move_lock * _us_norm
+    _raw_dn_ref := _base_move_lock * _ls_norm
+    _pred_hi := _pred_anch + _raw_up_ref * _cal_up_lock
+    _pred_lo := _pred_anch - _raw_dn_ref * _cal_dn_lock
+    _pred_width := _pred_hi - _pred_lo
+    _prev_cons := 0.0
+
+if not _intra
+    _pred_anch := _anch
+    float _var_ratio = _rv_m > 1e-12 ? math.sqrt(math.max(_hv_eff, 1e-10) / _rv_m) : 1.0
+    float _us_norm = _us / math.max((_us + _ls) * 0.5, 1e-6)
+    float _ls_norm = _ls / math.max((_us + _ls) * 0.5, 1e-6)
+    _base_move_live := nz(_avg_range, _pred_anch * math.sqrt(math.max(_hv_eff, 1e-10)) * 2.0) * 0.5 * _var_ratio * _eff_sigma
+    _raw_up_live := _base_move_live * _us_norm
+    _raw_dn_live := _base_move_live * _ls_norm
+    _pred_hi := _pred_anch + _raw_up_live * _next_cal_up
+    _pred_lo := _pred_anch - _raw_dn_live * _next_cal_dn
+    _pred_width := _pred_hi - _pred_lo
+
+float _cal_up = _intra ? nz(_cal_up_lock, _next_cal_up) : _next_cal_up
+float _cal_dn = _intra ? nz(_cal_dn_lock, _next_cal_dn) : _next_cal_dn
+int _cal_sessions_used = _intra ? _cal_sessions_lock : _cal_sessions
+float _base_move = _intra ? _base_move_lock : _base_move_live
+float _raw_up_half = _intra ? _raw_up_ref : _raw_up_live
+float _raw_dn_half = _intra ? _raw_dn_ref : _raw_dn_live
+
+// ================================================================
+// CONSUMPTION TRACKER
+// ================================================================
+var float _sess_hi = na
+var float _sess_lo = na
+
+if _intra and session.isfirstbar
+    _sess_hi := high
+    _sess_lo := low
+else if _intra
+    _sess_hi := math.max(nz(_sess_hi, high), high)
+    _sess_lo := math.min(nz(_sess_lo, low), low)
+
+float _consumed_pct = _intra and _pred_width > 0 ? (_sess_hi - _sess_lo) / _pred_width * 100.0 : na
+
+// ================================================================
+// SESSION TIMING + OPENING RANGE REFINEMENT
+// ================================================================
+float _tf_min = math.max(timeframe.in_seconds() / 60.0, 1.0)
+float _total_min = float(i_sess)
+
+var int _sess_bars = 0
+var float _opening_range_pct = na
+var float _or_adj = 1.0
+if _intra and session.isfirstbar
+    _sess_bars := 1
+    _opening_range_pct := na
+    _or_adj := 1.0
+else if _intra
+    _sess_bars += 1
+
+float _sess_elapsed = float(_sess_bars) * _tf_min
+float _sess_fraction = math.min(_sess_elapsed / _total_min, 1.0)
+bool _past_third = _sess_fraction >= 0.33
+
+float _or_threshold_min = 30.0
+if _intra and _sess_elapsed >= _or_threshold_min and _sess_elapsed < _or_threshold_min + _tf_min * 2
+    _opening_range_pct := nz(_consumed_pct, 0.0)
+    if _opening_range_pct > 35
+        _or_adj := 1.20
+    else if _opening_range_pct > 25
+        _or_adj := 1.10
+    else if _opening_range_pct < 10
+        _or_adj := 0.85
+    else
+        _or_adj := 1.0
+
+// ================================================================
+// DYNAMIC INTRADAY RANGE CONE
+// ================================================================
+float _rem_var_frac = _intra ? math.max((_total_min - _sess_elapsed) / _total_min, 0.02) : 1.0
+
+if _use_nse_diurnal
+    float _tot_var = array.sum(_dsum)
+    if _tot_var > 1e-12
+        float _cum_var = 0.0
+        float _prev_min = 0.0
+        float _prev_cv = 0.0
+        bool _found = false
+        var float[] _b_mins = array.from(45.0, 105.0, 165.0, 225.0, 285.0, 345.0, 375.0)
+        for i = 0 to 6
+            float _curr_min = f_arr_get_float(_b_mins, i, _prev_min)
+            float _bucket_var = f_arr_get_float(_dsum, i, 0.0) / _tot_var
+            float _curr_cv = _prev_cv + _bucket_var
+            if _sess_elapsed <= _curr_min and not _found
+                float _frac = (_sess_elapsed - _prev_min) / math.max(_curr_min - _prev_min, 1.0)
+                _cum_var := _prev_cv + _frac * (_curr_cv - _prev_cv)
+                _found := true
+            _prev_min := _curr_min
+            _prev_cv := _curr_cv
+        if _found
+            _rem_var_frac := math.max(1.0 - _cum_var, 0.02)
+
+float _hurst_exp = math.max(_H, 0.1)
+float _remaining_up = _intra and not na(_base_move) ? _base_move * _cal_up * math.pow(_rem_var_frac, _hurst_exp) * _or_adj : na
+float _remaining_dn = _intra and not na(_base_move) ? _base_move * _cal_dn * math.pow(_rem_var_frac, _hurst_exp) * _or_adj : na
+float _remaining_up_pts = _intra and not na(_remaining_up) ? _remaining_up * _us_norm_p : na
+float _remaining_dn_pts = _intra and not na(_remaining_dn) ? _remaining_dn * _ls_norm_p : na
+float _inner_hi = _intra and not na(_remaining_up_pts) ? close + _remaining_up_pts : na
+float _inner_lo = _intra and not na(_remaining_dn_pts) ? close - _remaining_dn_pts : na
+float _remaining_pts = _intra and not na(_remaining_up_pts) and not na(_remaining_dn_pts) ? _remaining_up_pts + _remaining_dn_pts : na
+
+// ================================================================
+// CONSUMPTION VELOCITY
+// ================================================================
+float _cons_velocity = _intra and not na(_consumed_pct) ? _consumed_pct - nz(_prev_cons, 0.0) : 0.0
+if _intra and not na(_consumed_pct)
+    _prev_cons := _consumed_pct
+
+// ================================================================
+// BREACH RISK + REGIME PRESSURE METRICS
+// ================================================================
+float _dist_up = not na(_pred_hi) and _pred_width > 0 ? (_pred_hi - close) / _pred_width : na
+float _dist_dn = not na(_pred_lo) and _pred_width > 0 ? (close - _pred_lo) / _pred_width : na
+float _nearest_dist = not na(_dist_up) and not na(_dist_dn) ? math.min(_dist_up, _dist_dn) : na
+float _nearest_band_pts = not na(_pred_hi) and not na(_pred_lo) ? math.min(math.abs(_pred_hi - close), math.abs(close - _pred_lo)) : na
+
+bool _breach_hi = not na(_pred_hi) and close > _pred_hi
+bool _breach_lo = not na(_pred_lo) and close < _pred_lo
+bool _at_upper = not na(_pred_hi) and high >= _pred_hi and _pred_hi > 0
+bool _at_lower = not na(_pred_lo) and low <= _pred_lo and _pred_lo > 0
+bool _above_anchor = not na(_pred_anch) and close > _pred_anch
+bool _below_anchor = not na(_pred_anch) and close < _pred_anch
+bool _inside_cone = _intra and not na(_inner_hi) and not na(_inner_lo) and close <= _inner_hi and close >= _inner_lo
+
+float _cons_adj = 0.0
+if not na(_consumed_pct)
+    if _consumed_pct > 100
+        _cons_adj := 35.0
+    else if _consumed_pct > 85
+        _cons_adj := 24.0
+    else if _consumed_pct > 65
+        _cons_adj := 12.0
+    else if _consumed_pct > 45
+        _cons_adj := 3.0
+    else if _consumed_pct > 25
+        _cons_adj := -6.0
+    else
+        _cons_adj := -15.0
+float _time_adj = not _intra ? 0.0 : _sess_fraction < 0.33 ? -8.0 : _sess_fraction < 0.67 ? 0.0 : 6.0
+float _vel_adj = _cons_velocity > 12 ? 8.0 : _cons_velocity > 6 ? 4.0 : _cons_velocity < 1 and _sess_fraction > 0.5 ? -5.0 : 0.0
+float _dist_adj = 0.0
+if not na(_nearest_dist)
+    if _nearest_dist < 0.05
+        _dist_adj := 15.0
+    else if _nearest_dist < 0.10
+        _dist_adj := 9.0
+    else if _nearest_dist < 0.20
+        _dist_adj := 4.0
+    else if _nearest_dist > 0.35
+        _dist_adj := -6.0
+float _hurst_adj = _H > 0.56 ? 5.0 : _H < 0.44 ? -4.0 : 0.0
+float _vov_adj = not na(_vov) and not na(_vov_med) and _vov > _vov_med * 1.15 ? 4.0 : 0.0
+float _jump_adj = _jfl > 0.5 ? 6.0 : 0.0
+float _anchor_adj = _below_anchor ? 2.0 : _above_anchor ? 1.0 : 0.0
+float _cone_adj = _intra and not na(_inner_hi) and not na(_inner_lo) ? (_inside_cone ? -2.0 : 5.0) : 0.0
+
+float _breach_raw = _preset_breach + _cons_adj + _time_adj + _vel_adj + _dist_adj + _hurst_adj + _vov_adj + _jump_adj + _anchor_adj + _cone_adj
+float _breach_prob = _intra ? math.max(3.0, math.min(95.0, _breach_raw)) : _preset_breach
+
+// ================================================================
+// MODEL CONFIDENCE
+// ================================================================
+bool _ols_active = math.abs(_bd - 0.36) > 1e-9 or math.abs(_bw - 0.28) > 1e-9 or math.abs(_bm - 0.28) > 1e-9
+bool _hurst_boundary = math.abs(_H - 0.35) < 1e-9 or math.abs(_H - 0.65) < 1e-9
+float _cal_div = math.max(_cal_up / math.max(_cal_dn, 1e-9), _cal_dn / math.max(_cal_up, 1e-9))
+bool _bars_ready = not na(_hv) and not na(_H) and not na(_avg_range) and not na(_rv_m)
+float _confidence = 100.0
+if _cal_sessions_used < 20
+    _confidence -= 20.0
+if not _ols_active
+    _confidence -= 10.0
+if not _recognized_symbol
+    _confidence -= 8.0
+if _is_nse_index and i_vix and na(_vix_raw)
+    _confidence -= 8.0
+if not _intra
+    _confidence -= 10.0
+if _hurst_boundary
+    _confidence -= 10.0
+if _cal_div > 1.8
+    _confidence -= 8.0
+if not _bars_ready
+    _confidence -= 10.0
+float _model_confidence = math.max(0.0, math.min(100.0, _confidence))
+
+// ================================================================
+// REGIME ENGINE
+// ================================================================
+bool _is_breach = _breach_hi or _breach_lo
+bool _is_pressure = _intra and not _is_breach and ((not na(_nearest_dist) and _nearest_dist < 0.10) or _breach_prob > 65)
+bool _is_trending = _intra and not _is_breach and (nz(_consumed_pct, 0.0) > 65 or _cons_velocity > 12 or (_H > 0.56 and nz(_consumed_pct, 0.0) > 55))
+bool _is_consolidating = _intra and not _is_breach and not _is_pressure and _past_third and nz(_consumed_pct, 0.0) < 35 and _cons_velocity < 3 and _breach_prob < 30
+
+string _raw_regime = 'NORMAL'
+if not _intra
+    _raw_regime := 'DAILY'
+else if _is_breach
+    _raw_regime := 'BREACH'
+else if _is_pressure
+    _raw_regime := 'PRESSURE'
+else if _sess_fraction < 0.33
+    _raw_regime := 'ACCUMULATING'
+else if _is_trending
+    _raw_regime := 'TRENDING'
+else if _is_consolidating
+    _raw_regime := 'CONSOLIDATING'
+
+var string _regime_prev = 'NORMAL'
+var int _regime_dwell_bars = 0
+var int _regime_downgrade_wait = 0
+string _regime = _raw_regime
+
+if not _intra
+    _regime := 'DAILY'
+    _regime_prev := _regime
+    _regime_dwell_bars := 0
+    _regime_downgrade_wait := 0
+else if session.isfirstbar
+    _regime := _raw_regime
+    _regime_prev := _regime
+    _regime_dwell_bars := 0
+    _regime_downgrade_wait := 0
+else
+    int _severity_raw = f_regime_severity(_raw_regime)
+    int _severity_prev = f_regime_severity(_regime_prev)
+    _regime := _regime_prev
+    if _severity_raw > _severity_prev
+        _regime := _raw_regime
+        _regime_prev := _regime
+        _regime_dwell_bars := 0
+        _regime_downgrade_wait := 0
+    else if _severity_raw < _severity_prev
+        _regime_downgrade_wait += 1
+        _regime_dwell_bars += 1
+        if _regime_downgrade_wait >= 3
+            _regime := _raw_regime
+            _regime_prev := _regime
+            _regime_dwell_bars := 0
+            _regime_downgrade_wait := 0
+    else
+        _regime_downgrade_wait := 0
+        if _raw_regime != _regime_prev
+            _regime := _raw_regime
+            _regime_prev := _regime
+            _regime_dwell_bars := 0
+        else
+            _regime := _regime_prev
+            _regime_dwell_bars += 1
+
+_cal_alpha_effective := f_cal_alpha(_regime)
+
+// ================================================================
+// WALK-FORWARD CONFORMAL UPDATE — session close only
+// ================================================================
+if _intra and session.islastbar and not na(_pred_anch) and not na(_raw_up_ref) and not na(_raw_dn_ref)
+    float _up_ratio = math.max(_sess_hi - _pred_anch, 0.0) / math.max(_raw_up_ref, 1e-9)
+    float _dn_ratio = math.max(_pred_anch - _sess_lo, 0.0) / math.max(_raw_dn_ref, 1e-9)
+    array.push(_up_ratio_hist, _up_ratio)
+    array.push(_dn_ratio_hist, _dn_ratio)
+    while array.size(_up_ratio_hist) > i_cal_len
+        array.shift(_up_ratio_hist)
+    while array.size(_dn_ratio_hist) > i_cal_len
+        array.shift(_dn_ratio_hist)
+    int _cal_sessions_live = int(math.min(array.size(_up_ratio_hist), array.size(_dn_ratio_hist)))
+    if i_adapt_cal and _cal_sessions_live >= 20
+        float _target_up = nz(_cal_up_state, _preset_sigma)
+        float _target_dn = nz(_cal_dn_state, _preset_sigma)
+        float _raw_q_up = f_weighted_quantile(_up_ratio_hist, i_target, _preset_sigma, i_decay)
+        float _raw_q_dn = f_weighted_quantile(_dn_ratio_hist, i_target, _preset_sigma, i_decay)
+        float _step_up = (_raw_q_up - _target_up) * _cal_alpha_effective
+        float _step_dn = (_raw_q_dn - _target_dn) * _cal_alpha_effective
+        _step_up := math.max(math.min(_step_up, 0.05), -0.05)
+        _step_dn := math.max(math.min(_step_dn, 0.05), -0.05)
+        _cal_up_state := math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, _target_up + _step_up))
+        _cal_dn_state := math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, _target_dn + _step_dn))
+    else
+        _cal_up_state := _preset_sigma
+        _cal_dn_state := _preset_sigma
+
+// ================================================================
+// PLOTTING — PREMIUM INSTITUTIONAL VISUALIZATION
+// ================================================================
+color c_band = color.rgb(60, 130, 220)
+color c_cone = color.rgb(0, 220, 160)
+color c_cone_fill = color.rgb(0, 200, 150)
+color c_cons_lo = color.rgb(40, 100, 200, 85)
+color c_cons_mid = color.rgb(255, 170, 0, 70)
+color c_cons_hi = color.rgb(255, 50, 80, 55)
+color c_cons_breach = color.rgb(255, 30, 60, 30)
+color c_cons_warn = color.rgb(255, 170, 0, 40)
+color c_consolidating = color.rgb(40, 140, 255)
+color c_trending = color.rgb(255, 50, 80)
+color c_pressure = color.rgb(255, 170, 0)
+color c_normal = color.rgb(180, 180, 190)
+color c_anchor = color.rgb(255, 191, 36, 40)
+color c_good = color.rgb(0, 220, 160)
+
+color _cons_fill = na
+if _intra and not na(_consumed_pct)
+    _cons_fill := _consumed_pct > 100 ? c_cons_breach : _consumed_pct > 75 ? c_cons_hi : _consumed_pct > 50 ? c_cons_mid : c_cons_lo
+
+p_hi = plot(_pred_hi, 'Range High', color.new(c_band, 20), 2)
+p_lo = plot(_pred_lo, 'Range Low', color.new(c_band, 20), 2)
+
+float _cone_hi_val = i_cone and _intra ? _inner_hi : na
+float _cone_lo_val = i_cone and _intra ? _inner_lo : na
+p_conehi = plot(_cone_hi_val, 'Cone Hi', color.new(c_cone, 10), 2, plot.style_linebr)
+p_conelo = plot(_cone_lo_val, 'Cone Lo', color.new(c_cone, 10), 2, plot.style_linebr)
+
+fill(p_hi, p_lo, color.new(c_band, 95), title='Full Range Light')
+fill(p_conehi, p_conelo, i_cone ? color.new(c_cone_fill, 80) : na, title='Cone Core')
+fill(p_hi, p_conehi, i_cone ? color.new(c_band, 90) : na, title='Upper Fade Zone')
+fill(p_conelo, p_lo, i_cone ? color.new(c_band, 90) : na, title='Lower Fade Zone')
+
+color _bar_col = na
+if _is_breach
+    _bar_col := color.new(c_trending, 0)
+else if _regime == 'PRESSURE'
+    _bar_col := color.new(c_pressure, 0)
+else if _at_upper or _at_lower
+    _bar_col := c_cons_warn
+barcolor(_bar_col, title='Boundary Bar Color')
+
+plot(i_anch ? _pred_anch : na, 'Anchor', c_anchor, 1, plot.style_line)
+
+p_sh = plot(i_cons and _intra ? _sess_hi : na, 'Session High', color.new(c_cons_mid, 60), 1, plot.style_linebr)
+p_sl = plot(i_cons and _intra ? _sess_lo : na, 'Session Low', color.new(c_cons_mid, 60), 1, plot.style_linebr)
+fill(p_sh, p_sl, i_cons ? _cons_fill : na, title='Consumed Range')
+
+var label[] _width_labels = array.new_label(0)
+if i_wlabel and _intra and session.isfirstbar and not na(_pred_hi) and not na(_pred_lo)
+    int n_stk = int(math.round(_pred_width / _strike_int))
+    string w_txt = str.tostring(_pred_width, '#') + ' pts\n' + str.tostring(n_stk) + ' strikes'
+    color w_col = _pred_width > 350 ? color.rgb(255, 100, 80) : _pred_width < 200 ? color.rgb(0, 200, 160) : color.rgb(180, 180, 200)
+    label _w_lbl = label.new(bar_index, _pred_hi, w_txt,
+         style=label.style_label_down, color=color.rgb(10, 10, 20, 20),
+         textcolor=w_col, size=size.tiny)
+    array.push(_width_labels, _w_lbl)
+    while array.size(_width_labels) > 250
+        label.delete(array.shift(_width_labels))
+
+var label _regime_lbl = na
+if _intra and barstate.islast
+    if not na(_regime_lbl)
+        label.delete(_regime_lbl)
+    string r_txt = '⚪ NORMAL\n' + str.tostring(_consumed_pct, '#.#') + '%'
+    if _regime == 'BREACH'
+        r_txt := '⛔ BREACH · Risk Off\n' + str.tostring(_breach_prob, '#.#') + '%'
+    else if _regime == 'PRESSURE'
+        r_txt := '🟠 PRESSURE · Edge Risk\n' + str.tostring(_breach_prob, '#.#') + '%'
+    else if _regime == 'TRENDING'
+        r_txt := '🔴 TREND · Direction\n' + str.tostring(_consumed_pct, '#.#') + '%'
+    else if _regime == 'CONSOLIDATING'
+        r_txt := '🔵 CONSOL · Sell Prem\n' + str.tostring(_consumed_pct, '#.#') + '%'
+    else if _regime == 'ACCUMULATING'
+        r_txt := '⏳ ACCUM\n' + str.tostring(_consumed_pct, '#.#') + '%'
+    color r_col = c_normal
+    if _regime == 'BREACH'
+        r_col := c_trending
+    else if _regime == 'PRESSURE'
+        r_col := c_pressure
+    else if _regime == 'TRENDING'
+        r_col := c_trending
+    else if _regime == 'CONSOLIDATING'
+        r_col := c_consolidating
+    else if _regime == 'ACCUMULATING'
+        r_col := c_cons_warn
+    _regime_lbl := label.new(bar_index + 3, _pred_anch, r_txt,
+         style=label.style_label_left, color=color.rgb(10, 10, 20, 30),
+         textcolor=r_col, size=size.normal)
+else if barstate.islast and not na(_regime_lbl)
+    label.delete(_regime_lbl)
+    _regime_lbl := na
+
+color _regime_bg = na
+if _intra
+    if _regime == 'BREACH'
+        _regime_bg := color.new(c_trending, 92)
+    else if _regime == 'PRESSURE'
+        _regime_bg := color.new(c_pressure, 94)
+    else if _regime == 'TRENDING'
+        _regime_bg := color.new(c_trending, 95)
+    else if _regime == 'CONSOLIDATING'
+        _regime_bg := color.new(c_consolidating, 95)
+bgcolor(_regime_bg, title='Regime Background')
+
+// ================================================================
+// SIGNAL STRIKES — Dynamic ATM + remaining boundary strikes
+// ================================================================
+var float _atm_stk = na
+var float _sig1_hi = na
+var float _sig1_lo = na
+
+f_in_range(float s) =>
+    not na(s) and not na(_pred_hi) and not na(_pred_lo) and s >= _pred_lo and s <= _pred_hi
+
+if i_strikes and ((_intra and session.isfirstbar) or not _intra) and not na(_pred_hi) and not na(_pred_lo)
+    _atm_stk := math.round(_pred_anch / _strike_int) * _strike_int
+
+float _si = float(_strike_int)
+if i_strikes and _intra and not na(_remaining_up_pts) and not na(_remaining_dn_pts)
+    float _cone_up = close + _remaining_up_pts
+    float _cone_dn = close - _remaining_dn_pts
+    _sig1_hi := math.round(_cone_up / _si) * _si
+    _sig1_lo := math.round(_cone_dn / _si) * _si
+
+plot(i_strikes and f_in_range(_atm_stk) ? _atm_stk : na, 'ATM Strike', color.new(color.rgb(255, 191, 36), 30), 2, plot.style_linebr)
+plot(i_strikes and f_in_range(_sig1_hi) ? _sig1_hi : na, '+1σ Rem', color.rgb(0, 200, 150, 50), 1, plot.style_linebr)
+plot(i_strikes and f_in_range(_sig1_lo) ? _sig1_lo : na, '-1σ Rem', color.rgb(0, 200, 150, 50), 1, plot.style_linebr)
+
+// ================================================================
+// MODEL STATE TABLE
+// ================================================================
+f_row(table tbl, int r, string lbl, string val, color vc) =>
+    table.cell(tbl, 0, r, lbl,
+         text_color=color.rgb(140, 145, 165), text_size=size.small,
+         bgcolor=na, text_halign=text.align_left)
+    table.cell(tbl, 1, r, val,
+         text_color=vc, text_size=size.small,
+         bgcolor=na, text_halign=text.align_right)
+
+f_section(table tbl, int r, string title) =>
+    table.cell(tbl, 0, r, title,
+         text_color=color.rgb(220, 225, 235), text_size=size.small,
+         bgcolor=color.rgb(18, 20, 28, 35), text_halign=text.align_left)
+    table.cell(tbl, 1, r, '',
+         text_color=color.rgb(220, 225, 235), text_size=size.small,
+         bgcolor=color.rgb(18, 20, 28, 35), text_halign=text.align_right)
+
+var table _T = table.new(position.top_right, 2, 23,
+     bgcolor=color.rgb(10, 10, 15, 10),
+     frame_color=color.rgb(30, 30, 45, 0), frame_width=1,
+     border_color=color.rgb(40, 40, 55, 50), border_width=1)
+
+if i_tbl and barstate.islast
+    float _ann = math.sqrt(math.max(_hv, 0.0) * 252.0) * 100.0
+    float _vov_ann = _vov * math.sqrt(252.0) * 100.0
+    int _n_strikes = _pred_width > 0 ? int(math.round(_pred_width / _strike_int)) : 0
+
+    color _reg_col = c_normal
+    if _regime == 'BREACH'
+        _reg_col := c_trending
+    else if _regime == 'PRESSURE'
+        _reg_col := c_pressure
+    else if _regime == 'TRENDING'
+        _reg_col := c_trending
+    else if _regime == 'CONSOLIDATING'
+        _reg_col := c_consolidating
+    else if _regime == 'ACCUMULATING'
+        _reg_col := c_cons_warn
+    string _reg_sig = '⚪ NORMAL'
+    if _regime == 'BREACH'
+        _reg_sig := '⛔ BREACH · Risk Off'
+    else if _regime == 'PRESSURE'
+        _reg_sig := '🟠 PRESSURE · Edge Risk'
+    else if _regime == 'TRENDING'
+        _reg_sig := '🔴 TREND · Direction'
+    else if _regime == 'CONSOLIDATING'
+        _reg_sig := '🔵 CONSOL · Sell Prem'
+    else if _regime == 'ACCUMULATING'
+        _reg_sig := '⏳ ACCUM'
+    else if _regime == 'DAILY'
+        _reg_sig := '📊 DAILY'
+    color _conf_col = _model_confidence >= 80 ? c_good : _model_confidence >= 60 ? c_pressure : c_trending
+    color _bpc = _breach_prob > 65 ? c_trending : _breach_prob > 35 ? c_pressure : c_good
+    color _cpc = c_normal
+    if not na(_consumed_pct)
+        if _consumed_pct > 100
+            _cpc := c_trending
+        else if _consumed_pct > 75
+            _cpc := c_pressure
+        else if _consumed_pct > 50
+            _cpc := color.rgb(255, 220, 100)
+        else
+            _cpc := c_good
+    color _cal_col = i_adapt_cal and _cal_sessions_used >= 20 ? c_good : c_pressure
+    color _ivrc = _use_vix and not na(_vix_raw) ? (_iv_rv_factor > 1.15 ? c_pressure : _iv_rv_factor < 0.85 ? c_good : c_normal) : c_normal
+    color _hcol = _H > 0.56 ? c_trending : _H < 0.44 ? c_good : c_normal
+    color _ols_col = _ols_active ? c_good : c_pressure
+
+    f_section(_T, 0, 'STATE')
+    f_row(_T, 1, 'REGIME', _reg_sig, _reg_col)
+    f_row(_T, 2, 'CONF', str.tostring(_model_confidence, '#') , _conf_col)
+    f_row(_T, 3, 'Breach %', str.tostring(_breach_prob, '#.#') + '%', _bpc)
+    f_row(_T, 4, 'Consumed %', na(_consumed_pct) ? '—' : str.tostring(_consumed_pct, '#.#') + '%', _cpc)
+
+    f_section(_T, 5, 'RANGE')
+    f_row(_T, 6, 'Anchor', str.tostring(nz(_pred_anch, 0.0), '#.##'), color.rgb(255, 191, 36))
+    f_row(_T, 7, 'Pred Range', str.tostring(nz(_pred_width, 0.0), '#.#') + ' pts · ' + str.tostring(_n_strikes) + ' stk', color.rgb(230, 230, 240))
+    f_row(_T, 8, 'Rem Up/DN', na(_remaining_up_pts) or na(_remaining_dn_pts) ? '—' : str.tostring(_remaining_up_pts, '#.#') + ' / ' + str.tostring(_remaining_dn_pts, '#.#'), c_cone)
+    f_row(_T, 9, 'Near Band', na(_nearest_dist) ? '—' : str.tostring(_nearest_dist * 100.0, '#.#') + '%', _bpc)
+
+    f_section(_T, 10, 'CALIBRATION')
+    f_row(_T, 11, 'Preset', str.tostring(_preset_sigma, '#.##') + 'σ', _recognized_symbol ? c_normal : c_pressure)
+    f_row(_T, 12, 'UP Cal', str.tostring(_cal_up, '#.##'), _cal_col)
+    f_row(_T, 13, 'DN Cal', str.tostring(_cal_dn, '#.##'), _cal_col)
+    f_row(_T, 14, 'Target', str.tostring(i_target * 100.0, '#.#') + '%', c_normal)
+    f_row(_T, 15, 'Cal Sess', str.tostring(_cal_sessions_used) + ' / ' + str.tostring(i_cal_len), _cal_col)
+
+    f_section(_T, 16, 'VOL MODEL')
+    f_row(_T, 17, 'HAR Vol', str.tostring(_ann, '#.##') + '%', color.rgb(255, 191, 36))
+    f_row(_T, 18, 'Hurst', str.tostring(_H, '#.###'), _hcol)
+    f_row(_T, 19, 'VOV', str.tostring(_vov_ann, '#.##') + '%', not na(_vov_med) and _vov > _vov_med * 1.15 ? c_pressure : c_normal)
+    f_row(_T, 20, 'IV/RV', _use_vix and not na(_vix_raw) ? str.tostring(_iv_rv_factor, '#.##') + '×' : _use_vix ? '—' : 'N/A', _ivrc)
+    f_row(_T, 21, 'β d/w/m', str.tostring(_bd, '#.##') + ' / ' + str.tostring(_bw, '#.##') + ' / ' + str.tostring(_bm, '#.##'), c_normal)
+    f_row(_T, 22, 'OLS', _ols_active ? 'Active' : 'Warmup', _ols_col)
+
+// ================================================================
+// DIAGNOSTIC CSV LOGGING
+// ================================================================
+if i_log and barstate.isfirst
+    log.info('time_ms,symbol,preset,tf,strike_step,session_min,close,anchor,pred_hi,pred_lo,raw_up_half,raw_dn_half,cal_up,cal_dn,target_containment,cal_sessions,model_confidence,har_vol%,hurst_H,sem_up,sem_down,vov%,jump_vol%,jump_flag,beta_d,beta_w,beta_m,diurnal_bk,diurnal_df,base_move,remaining_up,remaining_dn,consumed_pct,cons_velocity,nearest_band_dist,breach_prob,regime,sess_hi,sess_lo,ridge_lambda,har_fallback_used,cal_alpha_effective,regime_dwell_bars')
+
+if i_log and barstate.isconfirmed
+    float _log_ann = math.sqrt(math.max(_hv, 0.0) * 252.0) * 100.0
+    float _log_jann = math.sqrt(math.max(_jv, 0.0) * 252.0) * 100.0
+    float _log_vann = _vov * math.sqrt(252.0) * 100.0
+    int _log_bk = _use_nse_diurnal ? f_bucket() : -1
+    string _csv =
+         str.tostring(time) + ',' +
+         syminfo.ticker + ',' +
+         str.tostring(_preset_sigma, '#.##') + ',' +
+         timeframe.period + ',' +
+         str.tostring(_strike_int) + ',' +
+         str.tostring(i_sess) + ',' +
+         str.tostring(close, '#.##') + ',' +
+         str.tostring(_pred_anch, '#.##') + ',' +
+         str.tostring(_pred_hi, '#.##') + ',' +
+         str.tostring(_pred_lo, '#.##') + ',' +
+         str.tostring(_raw_up_half, '#.##') + ',' +
+         str.tostring(_raw_dn_half, '#.##') + ',' +
+         str.tostring(_cal_up, '#.####') + ',' +
+         str.tostring(_cal_dn, '#.####') + ',' +
+         str.tostring(i_target, '#.##') + ',' +
+         str.tostring(_cal_sessions_used) + ',' +
+         str.tostring(_model_confidence, '#') + ',' +
+         str.tostring(_log_ann, '#.##') + ',' +
+         str.tostring(_H, '#.####') + ',' +
+         str.tostring(_us, '#.####') + ',' +
+         str.tostring(_ls, '#.####') + ',' +
+         str.tostring(_log_vann, '#.##') + ',' +
+         str.tostring(_log_jann, '#.##') + ',' +
+         (_jfl > 0.5 ? '1' : '0') + ',' +
+         str.tostring(_bd, '#.####') + ',' +
+         str.tostring(_bw, '#.####') + ',' +
+         str.tostring(_bm, '#.####') + ',' +
+         str.tostring(_log_bk) + ',' +
+         str.tostring(_df, '#.####') + ',' +
+         str.tostring(_base_move, '#.##') + ',' +
+         str.tostring(_remaining_up, '#.##') + ',' +
+         str.tostring(_remaining_dn, '#.##') + ',' +
+         str.tostring(_consumed_pct, '#.##') + ',' +
+         str.tostring(_cons_velocity, '#.##') + ',' +
+         str.tostring(_nearest_dist, '#.####') + ',' +
+         str.tostring(_breach_prob, '#.##') + ',' +
+         _regime + ',' +
+         str.tostring(_sess_hi, '#.##') + ',' +
+         str.tostring(_sess_lo, '#.##') + ',' +
+         str.tostring(_ridge_lambda, '#.########') + ',' +
+         (_har_fallback_flag > 0.5 ? '1' : '0') + ',' +
+         str.tostring(_cal_alpha_effective, '#.####') + ',' +
+         str.tostring(_regime_dwell_bars)
+    log.info(_csv)
