@@ -1,0 +1,367 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © majhikeshab5
+
+//@version=6
+indicator("Institutional Delta Architecture (IDA)" , precision=3, overlay=false, max_boxes_count=500, max_labels_count=500, dynamic_requests=true)
+
+import bankniftyexplorer/kibrary/4 as k
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+length = input.int(12, title='Rsi Length', minval=1  , group = 'Rsi')
+smooth = input.int(2, title=' Smooth', minval=1  , group = 'Rsi')
+DECAY_FACTOR = input.float(0.99 , "DECAY_FACTOR", maxval = 1.0 , minval = 0.00001)
+
+candle_mrk_len  = input.int(60, title='Mark Length', minval=1)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+f_LastHLbar(series float high_src, series float low_src, series float linked_high ,series float linked_low) =>
+    var float candidateHigh = na
+    candidateHigh := high_src[1] > high_src[2] and high_src[1] > high_src ? math.max(linked_high[2] , linked_high[1] , linked_high): candidateHigh[1]
+
+    var float candidateLow = na
+    candidateLow := low_src[1] < low_src[2] and low_src[1] < low_src ? math.min(linked_low[2] ,linked_low[1] , linked_low) : candidateLow[1]
+    
+    [candidateHigh, candidateLow]
+
+f_mean_cross(mean_src ,o , c ,h ,l) =>
+    var float hh = na
+    var float ll = na
+    var float por = na // point of revarsal
+
+    kalman = k.f_kalman(mean_src,0.1,0.01)
+    condH = c[1] > kalman and c <= kalman or h > kalman and math.pow(o*c , 0.5) < kalman
+    condL = c[1] < kalman and c >= kalman or l < kalman and math.pow(o*c , 0.5) > kalman
+
+    por := condH ?  math.max(h,h[1]) : condL ? math.min(l[1] ,l) : por[1]
+    por
+
+CandleFix(float O , float H , float L , float C ) =>
+    fixnanO = fixnan(O)
+    fixnanH = fixnan(H)
+    fixnanL = fixnan(L)
+    fixnanC = fixnan(C)
+    fixnanV = na(fixnan(volume)) ? 1 : (volume)
+    [fixnanO , fixnanH , fixnanL , fixnanC , fixnanV ]
+
+
+f_4LegRsi(float FO, float FH, float FL, float FC, int length, int smooth) =>
+    o = ta.ema(ta.rsi(FO, length), smooth)
+    h = ta.ema(ta.rsi(math.max(FH,FC[1]), length), smooth)
+    l = ta.ema(ta.rsi(math.min(FL,FC[1]), length), smooth)
+    c = ta.ema(ta.rsi(FC, length), smooth)
+    
+    h := math.max(o, h, l, c)
+    l := math.min(o, h, l, c)
+    
+    [o , h ,l ,c]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DATA SOURCES & RSI CALCS
+// ═══════════════════════════════════════════════════════════════════════════
+[FO , FH , FL , FC , FV]= request.security(syminfo.tickerid , '' , CandleFix(open , high , low , close ) , lookahead = barmerge.lookahead_off)
+[hFO , hFH , hFL , hFC , hFV]= request.security(ticker.heikinashi(syminfo.tickerid) , '' , CandleFix(open , high , low , close ) , lookahead = barmerge.lookahead_off)
+
+[__open , __high , __low , __close] = k.f_4LegRsi(FO , FH , FL , FC , length,smooth)
+
+[delta , cumdelta] = k.f_CumulativeDelta(FO , FH , FL , FC , FV)
+rsi_delta = ta.ema(ta.rsi(cumdelta ,length) , smooth)
+[od , hd , ld , cd , avgd , dird] = k.HeikinAshi(rsi_delta[1] , rsi_delta)
+
+price_AvgRsi = math.avg(__open , __high , __low , __close)
+CombinedRsi =  ( price_AvgRsi - 50) + (rsi_delta - 50)
+
+[src_mx , src_mn ] = k.f_MxMn(__open , __high , __low ,__close)      
+src_mxmn = math.pow(__open*__high*__low*__close , 0.25)
+
+ma_src = f_mean_cross(src_mxmn ,__open,__close ,__high ,__low)
+
+// Map por for the Zone Gravity System
+float por = ma_src
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ZONE GRAVITY SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+var float[] ZONE_BOTTOM = array.from( 0.0, 23.6, 38.2, 50.0, 61.8, 78.6)
+var float[] ZONE_TOP    = array.from(23.6, 38.2, 50.0, 61.8, 78.6,100.0)
+
+int N_ZONES   = 6
+int N_BUCKETS = 4   
+
+var float[] visit_raw   = array.new_float(24, 0.0)  
+var float[] visit_delta = array.new_float(24, 0.0)  
+
+var float[] gravity_raw  = array.new_float(6, na )  
+var float[] gravity_k    = array.new_float(6, na )  
+var float[] kalman_p     = array.new_float(6, 0.1)  
+var float[] kalman_gain  = array.new_float(6, 1.0)  
+
+var int prev_zone = -1  
+
+f_getZone(float v) =>
+    int z = -1
+    if v >= 0.0 and v < 23.6
+        z := 0
+    else if v >= 23.6 and v < 38.2
+        z := 1
+    else if v >= 38.2 and v < 50.0
+        z := 2
+    else if v >= 50.0 and v < 61.8
+        z := 3
+    else if v >= 61.8 and v < 78.6
+        z := 4
+    else if v >= 78.6 and v <= 100.0
+        z := 5
+    z
+
+f_getBucket(float v, int zi) =>
+    float bot  = array.get(ZONE_BOTTOM, zi)
+    float top  = array.get(ZONE_TOP,    zi)
+    float band = (top - bot) / N_BUCKETS
+    int   b    = int(math.floor((v - bot) / band))
+    math.min(b, N_BUCKETS - 1)  
+
+f_bucketCenter(int zi, int bj) =>
+    float bot  = array.get(ZONE_BOTTOM, zi)
+    float top  = array.get(ZONE_TOP,    zi)
+    float band = (top - bot) / N_BUCKETS
+    bot + band * float(bj) + band * 0.5
+
+f_kalmanUpdate(int zi, float new_obs) =>
+    float Q      = 0.005
+    float R      = 0.5
+    float p_prev = array.get(kalman_p,    zi)
+    float p_pred = p_prev + Q
+    float gain   = p_pred / (p_pred + R)
+    float p_new  = (1.0 - gain) * p_pred
+
+    array.set(kalman_p,    zi, p_new)
+    array.set(kalman_gain, zi, gain)           
+
+    float prev_gk = array.get(gravity_k, zi)
+    float gk_new  = na(prev_gk) ? new_obs : prev_gk + gain * (new_obs - prev_gk)
+    array.set(gravity_k, zi, gk_new)
+    gk_new
+
+f_updateGravity(float src, float delta_w) =>
+    int zi = f_getZone(src)
+
+    if zi >= 0
+        int   bj    = f_getBucket(src, zi)
+        int   idx   = zi * N_BUCKETS + bj
+
+        array.set(visit_raw,   idx, array.get(visit_raw,   idx) + 1.0)
+        array.set(visit_delta, idx, array.get(visit_delta, idx) + math.abs(delta_w))
+
+        float best_w  = -1.0
+        int   best_bj = 0
+        for j = 0 to N_BUCKETS - 1
+            float w = array.get(visit_delta, zi * N_BUCKETS + j)
+            if w > best_w
+                best_w  := w
+                best_bj := j
+
+        float raw_g = f_bucketCenter(zi, best_bj)
+        array.set(gravity_raw, zi, raw_g)
+        f_kalmanUpdate(zi, raw_g)
+
+    zi
+
+for i = 0 to 23
+    array.set(visit_raw,   i, array.get(visit_raw,   i) * DECAY_FACTOR)
+    array.set(visit_delta, i, array.get(visit_delta, i) * DECAY_FACTOR)
+
+float delta_w  = rsi_delta - 50.0                         
+int   curr_z   = f_updateGravity(ma_src, delta_w)         
+prev_zone := curr_z
+
+float grav_z0 = array.get(gravity_k, 0)   
+float grav_z1 = array.get(gravity_k, 1)   
+float grav_z2 = array.get(gravity_k, 2)   
+float grav_z3 = array.get(gravity_k, 3)   
+float grav_z4 = array.get(gravity_k, 4)   
+float grav_z5 = array.get(gravity_k, 5)   
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ORIGINAL CANDLE LOGIC & PLOTTING
+// ═══════════════════════════════════════════════════════════════════════════
+EMA(o,h,l,c , smooth) =>
+    s_o = ta.ema(o,smooth)
+    s_h = ta.ema(h,smooth)
+    s_l = ta.ema(l,smooth)
+    s_c = ta.ema(c,smooth)
+    [s_o , s_h , s_l , s_c]
+
+[s_o , s_h , s_l , s_c] = EMA(FO,FH,FL,FC ,smooth)
+
+minLevel = math.min(FC[1], FL)
+guard  = syminfo.mintick
+
+pc = ((math.max((FC -minLevel),guard) - math.max((FO - minLevel), guard)))*100/ math.max((math.max(FC[1], FH) - minLevel), guard)
+rsc = ( __close - __open)    
+
+ur = math.sum( rsc >= 0 and pc != 0 ?  rsc/pc : 0 , candle_mrk_len)
+ur_ = math.sum( rsc >= 0 ?  1 : 0 , candle_mrk_len )
+ur := (ur_ == 0 ? 0 : ur / ur_ )
+
+dr = math.sum(rsc < 0 and pc != 0 ?  (rsc/pc) : 0  , candle_mrk_len)
+dr_ = math.sum(rsc < 0 ?  1 : 0  , candle_mrk_len )
+dr := (dr_ == 0 ? 0 : dr / dr_ )
+
+grater_response = math.abs(ur) > math.abs(dr)
+
+float candle_range = math.max(__high , __close[1]) - math.min(__low , __close[1]) + math.max(hd , cd[1]) - math.min(ld , cd[1])
+max_candle = ta.highest(candle_range , candle_mrk_len ) == candle_range
+CombinedRsiCng = CombinedRsi >= CombinedRsi[1]
+
+color LargeCandle = max_candle  and CombinedRsi <= CombinedRsi[1] ? color.rgb(0,0,255) : max_candle and CombinedRsi > CombinedRsi[1]   ? color.rgb(255,255,0) : na
+
+color RsiUpCandle = max_candle and CombinedRsiCng ? color.rgb (255,255,0) : grater_response ?  color.rgb(0, 255, 0) : color.rgb(0,160,0)
+color RsiDownCandle = max_candle and not CombinedRsiCng? color.rgb (0,0,255) : not grater_response ?  color.rgb(255,0,0)   : color.rgb(160,0,160)
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// [INJECTED] STRIKE PRICE DELTA PROFILE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Strike Profile Inputs ───────────────────────────────────────────────────
+string sdp_exp     = input.string("260415", "Options Expiry YYMMDD",
+  group="Strike Delta Profile",
+  tooltip="TradingView expiry in YYMMDD format. Check any option ticker for the date.")
+int    sdp_atm_in  = input.int(23800, "ATM Strike Price",
+  group="Strike Delta Profile",
+  tooltip="Set to the nearest round strike of current spot. Example: if NIFTY is 23775, enter 23800 (step=50) or 23800 (step=100).")
+  group="Strike Delta Profile")
+  group="Strike Delta Profile")
+
+  group="Strike Delta Profile")
+  group="Strike Delta Profile", tooltip="Shows the exact asset mappings and request strings to help debug why symbols aren't returning data.")
+// ─── Asset Guard ─────────────────────────────────────────────────────────────
+bool sdp_active = (syminfo.type == "index" and (str.contains(syminfo.prefix, "NSE") or str.contains(syminfo.prefix, "BSE"))) or syminfo.prefix == "MCX" or (syminfo.prefix == "NSE" and syminfo.root == "MCX")
+
+// ─── Auto Step Detection ─────────────────────────────────────────────────────
+int sdp_step = 50 // Default for Nifty, Finnifty, etc.
+if str.contains(syminfo.root, "BANKNIFTY") or str.contains(syminfo.root, "SENSEX") or str.contains(syminfo.root, "BANKEX") or str.contains(syminfo.root, "NIFTYNXT50") or str.contains(syminfo.root, "NIFTYJR")
+    sdp_step := 100
+else if str.contains(syminfo.root, "MIDCPNIFTY") or str.contains(syminfo.root, "NIFTY_MID_SELECT")
+    sdp_step := 25
+else if syminfo.prefix == "NSE" and syminfo.root == "MCX"
+    sdp_step := 20 // The NSE:MCX stock options typically trade in steps of 20
+else if syminfo.prefix == "MCX"
+    if str.contains(syminfo.root, "SILVER")
+        sdp_step := 500
+    else if str.contains(syminfo.root, "CRUDEOIL") or str.contains(syminfo.root, "GOLD")
+        sdp_step := 100
+    else if str.contains(syminfo.root, "NATURALGAS")
+        sdp_step := 5
+
+// Auto-snap the user's ATM input to perfectly align with the step grid 
+// (e.g. if user types 77550 on Sensex, it snaps to 77600 to prevent NaN requests)
+int sdp_atm = int(math.round(sdp_atm_in / float(sdp_step)) * float(sdp_step))
+
+// ─── Cumulative Net Delta Engine ─────────────────────────────────────────────
+f_sdp_cum_delta() =>
+    float _tw       = math.max(high, close[1]) - math.max(open, close)
+    float _bw       = math.min(open, close)    - math.min(low, close[1])
+    float _body     = math.abs(open - close)
+    float _tw_sq    = _tw * _tw
+    float _bw_sq    = _bw * _bw
+    float _body_sq  = _body * _body
+    float _total_sq = _tw_sq + _bw_sq + _body_sq
+    bool  _bullish  = (_bw + (close - open) - _tw) >= 0
+    float _buy_sh   = _bw_sq + (_bullish     ? _body_sq : 0)
+    float _sell_sh  = _tw_sq + (not _bullish ? _body_sq : 0)
+    float _buy_pct  = _total_sq > 0 ? _buy_sh  / _total_sq : 0.5
+    float _sell_pct = _total_sq > 0 ? _sell_sh / _total_sq : 0.5
+    float _net_tick = nz(volume, 0) * (_bullish ? _buy_pct  : - _sell_pct)
+    ta.cum(_net_tick)
+
+// ─── Option Root & Prefix Mapping ────────────────────────────────────────────
+// Clean the prefix (removes _DLY or other feed tags)
+string sdp_opt_prefix = syminfo.prefix == "MCX" ? "MCX" : str.contains(syminfo.prefix, "BSE") ? "BSE" : "NSE"
+
+string sdp_opt_root = syminfo.root
+if syminfo.root == "SENSEX"
+    sdp_opt_root := "BSX"
+else if syminfo.root == "BANKEX"
+    sdp_opt_root := "BKX"
+else if str.contains(syminfo.root, "CNXFINANCE")
+    sdp_opt_root := "FINNIFTY"
+else if str.contains(syminfo.root, "NIFTY_MID_SELECT")
+    sdp_opt_root := "MIDCPNIFTY"
+else if str.contains(syminfo.root, "NIFTYJR")
+    sdp_opt_root := "NIFTYNXT50"
+
+f_sdp_tk(int strike, string opt_type) =>
+    sdp_opt_prefix + ":" + sdp_opt_root + sdp_exp + opt_type + str.tostring(strike)
+
+// ─── Security Calls: 19 Strikes × 2 Legs = 38 Requests ─────────────────────
+f_fetch_both() =>
+    [math.avg(open, high, low, close), f_sdp_cum_delta()]
+
+[ce_o4_u9, sdp_ce_u9] = request.security(f_sdp_tk(sdp_atm + 9*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u9, sdp_pe_u9] = request.security(f_sdp_tk(sdp_atm + 9*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u8, sdp_ce_u8] = request.security(f_sdp_tk(sdp_atm + 8*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u8, sdp_pe_u8] = request.security(f_sdp_tk(sdp_atm + 8*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u7, sdp_ce_u7] = request.security(f_sdp_tk(sdp_atm + 7*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u7, sdp_pe_u7] = request.security(f_sdp_tk(sdp_atm + 7*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u6, sdp_ce_u6] = request.security(f_sdp_tk(sdp_atm + 6*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u6, sdp_pe_u6] = request.security(f_sdp_tk(sdp_atm + 6*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u5, sdp_ce_u5] = request.security(f_sdp_tk(sdp_atm + 5*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u5, sdp_pe_u5] = request.security(f_sdp_tk(sdp_atm + 5*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u4, sdp_ce_u4] = request.security(f_sdp_tk(sdp_atm + 4*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u4, sdp_pe_u4] = request.security(f_sdp_tk(sdp_atm + 4*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u3, sdp_ce_u3] = request.security(f_sdp_tk(sdp_atm + 3*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u3, sdp_pe_u3] = request.security(f_sdp_tk(sdp_atm + 3*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u2, sdp_ce_u2] = request.security(f_sdp_tk(sdp_atm + 2*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u2, sdp_pe_u2] = request.security(f_sdp_tk(sdp_atm + 2*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u1, sdp_ce_u1] = request.security(f_sdp_tk(sdp_atm + 1*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u1, sdp_pe_u1] = request.security(f_sdp_tk(sdp_atm + 1*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_0,  sdp_ce_0]  = request.security(f_sdp_tk(sdp_atm,              "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_0,  sdp_pe_0]  = request.security(f_sdp_tk(sdp_atm,              "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d1, sdp_ce_d1] = request.security(f_sdp_tk(sdp_atm - 1*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d1, sdp_pe_d1] = request.security(f_sdp_tk(sdp_atm - 1*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d2, sdp_ce_d2] = request.security(f_sdp_tk(sdp_atm - 2*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d2, sdp_pe_d2] = request.security(f_sdp_tk(sdp_atm - 2*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d3, sdp_ce_d3] = request.security(f_sdp_tk(sdp_atm - 3*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d3, sdp_pe_d3] = request.security(f_sdp_tk(sdp_atm - 3*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d4, sdp_ce_d4] = request.security(f_sdp_tk(sdp_atm - 4*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d4, sdp_pe_d4] = request.security(f_sdp_tk(sdp_atm - 4*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d5, sdp_ce_d5] = request.security(f_sdp_tk(sdp_atm - 5*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d5, sdp_pe_d5] = request.security(f_sdp_tk(sdp_atm - 5*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d6, sdp_ce_d6] = request.security(f_sdp_tk(sdp_atm - 6*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d6, sdp_pe_d6] = request.security(f_sdp_tk(sdp_atm - 6*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d7, sdp_ce_d7] = request.security(f_sdp_tk(sdp_atm - 7*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d7, sdp_pe_d7] = request.security(f_sdp_tk(sdp_atm - 7*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d8, sdp_ce_d8] = request.security(f_sdp_tk(sdp_atm - 8*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d8, sdp_pe_d8] = request.security(f_sdp_tk(sdp_atm - 8*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d9, sdp_ce_d9] = request.security(f_sdp_tk(sdp_atm - 9*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d9, sdp_pe_d9] = request.security(f_sdp_tk(sdp_atm - 9*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOGGING ENGINE (AUDIT MODE)
+// ═══════════════════════════════════════════════════════════════════════════
+if sdp_active
+    log.info(
+      "Idx:{0}|Spot:{1}|ATR:{2}|Score:{3}|ATM:{4}|CE4:{5}|PE4:{6}|CDom:{7}|CWt:{8}|CVel:{9}|PVel:{10}|U1D:{11}|D1D:{12}",
+      str.tostring(bar_index), 
+      str.tostring(close, "#.##"), 
+      str.tostring(idx_atr, "#.##"), 
+      str.tostring(ComparatorScore, "#.####"),
+      str.tostring(sdp_atm),
+      str.tostring(ce_o4_0, "#.##"),
+      str.tostring(pe_o4_0, "#.##"),
+      str.tostring(g_0, "#.####"), 
+      str.tostring(w_0, "#.####"), 
+      str.tostring(cv_0, "#.####"), 
+      str.tostring(pv_0, "#.####"),
+      str.tostring(g_u1, "#.####"),
+      str.tostring(g_d1, "#.####")
+      )

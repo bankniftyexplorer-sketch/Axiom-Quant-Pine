@@ -1,32 +1,32 @@
 //@version=6
 // ================================================================
-// IRP v7 — Adaptive Conformal Range Cone Quant Engine
-// Locked-at-open predicted range with adaptive walk-forward
-// conformal calibration, asymmetric remaining cone, calibrated
-// breach risk, regime classification, model confidence, and
-// diagnostic logging.
+// IRP v8 — Adaptive Exceedance Cone | Buyer's Edge Engine
+// Dual-band locked-at-open predicted range with adaptive walk-forward
+// conformal calibration, asymmetric remaining cone, breakout scoring,
+// directional lean, buyer regime classification, model confidence,
+// and diagnostic logging.
 // ================================================================
-// Operational thresholds for breach_prob (informational - not enforced):
-//   < 50  : safe
-//   50-69 : monitor
-//   70-81 : warn - consider hedge
-//   >= 82 : act  - exit naked short premium / roll strikes
-//   95    : hard cap (do not infer extra information beyond 95)
+// Operational thresholds for breakout_score (heuristic score, NOT a probability):
+//   < 25  : DEAD    - no opportunity, sit flat
+//   25-44 : WATCH   - not yet, be patient
+//   45-64 : PREPARE - breakout developing, size position
+//   65-79 : ENTER   - confirmed opportunity, execute
+//   >= 80 : MAXIMUM - rare, full conviction entry
 //
 // ===== Operating Notes =====
 // 1. Allow >= 20 sessions of warmup per new symbol before trusting calibration.
 //    Sessions 0-19  : pure preset.
 //    Sessions 20-39 : blended preset/adaptive.
 //    Sessions 40+   : pure adaptive.
-// 2. Validate across NORMAL, TREND, PRESSURE, and BREACH days before live use.
-// 3. Suggested options-selling rules of thumb (informational, not signals):
-//    - Reduce / hedge when breach_prob > 70 AND consumed_pct > 70.
-//    - Exit naked short premium when breach_prob >= 82.
-// 4. Re-export log.csv weekly. Track realized containment vs target_containment.
-//    Re-tune preset only after >= 60 sessions of drift exceeding +/- 5%.
-// 5. A single breach day is not a failure - a probabilistic cone is expected
-//    to be overrun on tail events at roughly (1 - target_containment) frequency.
-indicator('IRP v7 [Adaptive Conformal Range Cone]', overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+// 2. Validate across BUILDING, WATCH, RIDING, LOADING, and BREAKOUT sessions.
+// 3. Dual-band architecture:
+//    - Inner band targets 80.4% per-side containment (~62% joint) for frequent buyer triggers.
+//    - Outer fortress targets 97.5% per-side containment (~95% joint) for tail-event context.
+// 4. Breakout score and direction lean are interpretive layers only. Core math,
+//    HAR-RV, BPV, Hurst, semivariance, and conformal engine stay unchanged.
+// 5. Re-export log.csv weekly. Track realized inner/outer exceedance rates
+//    before re-tuning presets after sustained drift.
+indicator('IRP v8 [Adaptive Exceedance Cone · Buyer Edge]', overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
 
 // ================================================================
 // INPUTS
@@ -41,6 +41,7 @@ i_dir  = input.bool(true, 'Empirical Diurnal', group='Engine', tooltip='NSE diur
 
 i_sigma  = input.float(1.0, 'Base Sigma Level', minval=0.5, maxval=3.0, step=0.25, group='Range', tooltip='Base sigma applied before conformal calibration. Final locked range = raw range × directional conformal calibration.')
 i_sigma2 = input.float(0.0, 'Secondary Sigma (0=off)', minval=0.0, maxval=3.0, step=0.25, group='Range', tooltip='Optional second band placeholder. Set 0 to disable.')
+i_inner_target = input.float(0.804, 'Inner Containment (per-side)', minval=0.60, maxval=0.90, step=0.01, group='Calibration', tooltip='Per-side quantile. 0.804 = about 62% joint containment and about 38% joint exceedance rate. UP and DN calibrate independently, so joint containment is approximately q^2 when uncoupled.')
 i_react  = input.float(0.4, 'Daily Reactivity', minval=0.0, maxval=1.0, step=0.1, group='Range', tooltip='0=pure HAR (smooth), 0.4=balanced, 1.0=fully reactive to yesterday. Controls day-to-day width variation.')
 i_rcap   = input.float(2.0, 'Reactivity Cap', minval=1.0, maxval=4.0, step=0.25, group='Range', tooltip='Caps the daily reactivity multiplier symmetrically around 1.0 to prevent extreme post-shock distortions.')
 i_vix    = input.bool(true, 'India VIX Overlay', group='Range', tooltip='Scales predicted range using IV-RV spread from India VIX. Only works on eligible NSE index symbols.')
@@ -48,10 +49,11 @@ i_vix_wt = input.float(0.5, 'VIX Blend Weight', minval=0.0, maxval=1.0, step=0.1
 
 i_adapt_cal = input.bool(true, 'Adaptive Conformal Calibration', group='Calibration')
 i_cal_len   = input.int(60, 'Calibration Sessions', minval=20, maxval=250, group='Calibration')
-i_target    = input.float(0.72, 'Target Containment', minval=0.50, maxval=0.95, step=0.01, group='Calibration')
+i_target    = input.float(0.975, 'Outer Containment (per-side Fortress)', minval=0.90, maxval=0.999, step=0.001, group='Calibration', tooltip='Per-side quantile. 0.975 = about 95% joint containment and about 5% joint exceedance rate. Fortress boundary.')
 i_decay     = input.float(0.985, 'Calibration Decay', minval=0.95, maxval=1.0, step=0.005, group='Calibration', tooltip='Recent sessions receive more weight in the adaptive conformal calibration.')
 
 i_cone       = input.bool(true,  'Dynamic Range Cone',                group='Display', tooltip='Time-progressive narrowing bands showing remaining expected move. The critical visual for options theta context.')
+i_buyer_pro  = input.bool(true, 'Buyer Pro Mode (Minimalist)', group='Display', tooltip='Strict minimalist mode for options buyers. Kills all background fills, shading, and markers. Preserves only boundary lines, bar colors, and the data table.')
 i_strikes    = input.bool(true,  'Strike Markers',                    group='Display')
 i_strike_ovr = input.int(0,      'Strike Interval Override (0=auto)', minval=0, maxval=500, group='Display', tooltip='Auto: NIFTY=50, BANKNIFTY=100, FINNIFTY=50, MIDCPNIFTY=25, SENSEX=100, BANKEX=100')
 i_cons       = input.bool(true,  'Consumption Fill',                  group='Display')
@@ -81,36 +83,36 @@ f_symbol_key() =>
     key
 
 f_preset_sigma(string sym) =>
-    float sig = 1.75
+    float sig = 3.00
     if sym == 'NIFTY'
-        sig := 1.57
+        sig := 2.79
     else if sym == 'BANKNIFTY'
-        sig := 1.80
+        sig := 3.04
     else if sym == 'SENSEX'
-        sig := 1.85
+        sig := 3.29
     else if sym == 'CNXFINANCE'
-        sig := 1.65
+        sig := 3.05
     else if sym == 'NIFTYJR'
-        sig := 1.70
+        sig := 3.00
     else if sym == 'BTCUSDT'
-        sig := 2.22
+        sig := 1.82
     sig
 
-f_preset_breach(string sym) =>
-    float risk = 35.00
+f_preset_inner_sigma(string sym) =>
+    float sig = 1.50
     if sym == 'NIFTY'
-        risk := 34.27
+        sig := 1.39
     else if sym == 'BANKNIFTY'
-        risk := 35.73
+        sig := 1.57
     else if sym == 'SENSEX'
-        risk := 40.24
+        sig := 1.67
     else if sym == 'CNXFINANCE'
-        risk := 37.80
+        sig := 1.61
     else if sym == 'NIFTYJR'
-        risk := 39.15
+        sig := 1.55
     else if sym == 'BTCUSDT'
-        risk := 28.95
-    risk
+        sig := 1.53
+    sig
 
 f_is_nse_index() =>
     string tk = syminfo.ticker
@@ -169,7 +171,12 @@ f_mat_identity(int n) =>
     out
 
 f_cal_alpha(string regime) =>
-    regime == 'PRESSURE' or regime == 'BREACH' ? 0.25 : regime == 'TRENDING' ? 0.15 : 0.05
+    float alpha = 0.05
+    if regime == 'LOADING' or regime == 'BREAKOUT'
+        alpha := 0.25
+    else if regime == 'RIDING'
+        alpha := 0.15
+    alpha
 
 f_cal_warmup_blend(float preset, float adaptive, int cal_sessions) =>
     if cal_sessions < 20
@@ -182,17 +189,26 @@ f_cal_warmup_blend(float preset, float adaptive, int cal_sessions) =>
 
 f_cal_clamps(string sym) =>
     float lo_clamp = 0.85
-    float hi_clamp = 1.80
+    float hi_clamp = 3.50
     if sym == 'BANKNIFTY'
         lo_clamp := 0.90
-        hi_clamp := 2.00
+        hi_clamp := 4.00
     else if sym == 'BTCUSDT'
         lo_clamp := 0.95
-        hi_clamp := 2.50
+        hi_clamp := 5.00
     [lo_clamp, hi_clamp]
 
 f_regime_severity(string regime) =>
-    regime == 'BREACH' ? 4 : regime == 'PRESSURE' ? 3 : regime == 'TRENDING' ? 2 : regime == 'DAILY' ? 0 : 1
+    int severity = 0
+    if regime == 'BREAKOUT'
+        severity := 4
+    else if regime == 'LOADING'
+        severity := 3
+    else if regime == 'RIDING'
+        severity := 2
+    else if regime == 'WATCH' or regime == 'BUILDING'
+        severity := 1
+    severity
 
 f_quantile(float[] src, float q, float fallback) =>
     int n = array.size(src)
@@ -243,7 +259,7 @@ bool _recognized_symbol = _symbol_key != 'GENERIC'
 bool _is_nse = str.contains(syminfo.prefix, 'NSE')
 bool _is_nse_index = f_is_nse_index()
 float _preset_sigma = f_preset_sigma(_symbol_key)
-float _preset_breach = f_preset_breach(_symbol_key)
+float _preset_inner_sigma = f_preset_inner_sigma(_symbol_key)
 int _strike_int = i_strike_ovr > 0 ? i_strike_ovr : f_strike_int()
 
 // ================================================================
@@ -451,11 +467,16 @@ float _hv_eff = math.max(_hv * _react_ratio * (_use_vix ? _iv_rv_factor : 1.0), 
 bool _intra = not (timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly)
 bool _use_nse_diurnal = i_dir and _intra and _is_nse_index
 var float[] _dsum = array.new_float(7, 0.0)
-var int[] _dcnt = array.new_int(7, 0)
+var float[] _dcnt = array.new_float(7, 0.0)
 
 f_bucket() =>
     int h = hour(time, 'Asia/Kolkata')
     h >= 9 and h <= 15 ? h - 9 : -1
+
+if _use_nse_diurnal and _intra and session.isfirstbar
+    for _di = 0 to 6
+        array.set(_dsum, _di, f_arr_get_float(_dsum, _di, 0.0) * 0.997)
+        array.set(_dcnt, _di, f_arr_get_float(_dcnt, _di, 0.0) * 0.997)
 
 if _use_nse_diurnal and not na(close[1])
     int bk = f_bucket()
@@ -463,29 +484,32 @@ if _use_nse_diurnal and not na(close[1])
         float _dr = session.isfirstbar ? math.log(math.max(close, 1e-9) / math.max(open, 1e-9)) : math.log(math.max(close, 1e-9) / math.max(close[1], 1e-9))
         float sq = _dr * _dr
         array.set(_dsum, bk, f_arr_get_float(_dsum, bk, 0.0) + sq)
-        array.set(_dcnt, bk, f_arr_get_int(_dcnt, bk, 0) + 1)
+        array.set(_dcnt, bk, f_arr_get_float(_dcnt, bk, 0.0) + 1.0)
 
 float _df = 1.0
 if _use_nse_diurnal
     int bk = f_bucket()
-    int _bk_cnt = f_arr_get_int(_dcnt, bk, 0)
-    if bk >= 0 and bk < array.size(_dsum) and bk < array.size(_dcnt) and _bk_cnt >= 10
+    float _bk_cnt = f_arr_get_float(_dcnt, bk, 0.0)
+    if bk >= 0 and bk < array.size(_dsum) and bk < array.size(_dcnt) and _bk_cnt >= 10.0
         float tot = array.sum(_dsum)
-        int tcn = 0
+        float tcn = 0.0
         for j = 0 to 6
-            tcn += f_arr_get_int(_dcnt, j, 0)
+            tcn += f_arr_get_float(_dcnt, j, 0.0)
         if tcn > 0
             float ovr = tot / tcn
             float bkt_mn = f_arr_get_float(_dsum, bk, 0.0) / _bk_cnt
             _df := ovr > 1e-12 ? bkt_mn / ovr : 1.0
 
 // ================================================================
-// ADAPTIVE CONFORMAL CALIBRATION STATE
+// DUAL-BAND CONFORMAL CALIBRATION STATE
 // ================================================================
 var float _pred_hi = na
 var float _pred_lo = na
 var float _pred_anch = na
 var float _pred_width = na
+var float _inner_hi = na
+var float _inner_lo = na
+var float _inner_width = na
 var float _us_norm_p = 1.0
 var float _ls_norm_p = 1.0
 var float _base_move_lock = na
@@ -493,18 +517,26 @@ var float _raw_up_ref = na
 var float _raw_dn_ref = na
 var float _cal_up_lock = na
 var float _cal_dn_lock = na
+var float _cal_inner_up_lock = na
+var float _cal_inner_dn_lock = na
 var int _cal_sessions_lock = 0
 var float _prev_cons = 0.0
 var float[] _up_ratio_hist = array.new_float(0)
 var float[] _dn_ratio_hist = array.new_float(0)
 var float _cal_up_state = na
 var float _cal_dn_state = na
+var float _cal_inner_up_state = na
+var float _cal_inner_dn_state = na
 var float _cal_alpha_effective = 0.05
 
 if na(_cal_up_state)
     _cal_up_state := _preset_sigma
 if na(_cal_dn_state)
     _cal_dn_state := _preset_sigma
+if na(_cal_inner_up_state)
+    _cal_inner_up_state := _preset_inner_sigma
+if na(_cal_inner_dn_state)
+    _cal_inner_dn_state := _preset_inner_sigma
 
 while array.size(_up_ratio_hist) > i_cal_len
     array.shift(_up_ratio_hist)
@@ -512,13 +544,20 @@ while array.size(_dn_ratio_hist) > i_cal_len
     array.shift(_dn_ratio_hist)
 
 int _cal_sessions = int(math.min(array.size(_up_ratio_hist), array.size(_dn_ratio_hist)))
-float _conf_up = f_weighted_quantile(_up_ratio_hist, i_target, _preset_sigma, i_decay)
-float _conf_dn = f_weighted_quantile(_dn_ratio_hist, i_target, _preset_sigma, i_decay)
+float _cal_decay_eff = not na(_vov) and not na(_vov_med) and _vov > _vov_med * 1.15 ? math.max(i_decay - 0.015, 0.95) : i_decay
+float _conf_up = f_weighted_quantile(_up_ratio_hist, i_target, _preset_sigma, _cal_decay_eff)
+float _conf_dn = f_weighted_quantile(_dn_ratio_hist, i_target, _preset_sigma, _cal_decay_eff)
+float _conf_inner_up = f_weighted_quantile(_up_ratio_hist, i_inner_target, _preset_inner_sigma, _cal_decay_eff)
+float _conf_inner_dn = f_weighted_quantile(_dn_ratio_hist, i_inner_target, _preset_inner_sigma, _cal_decay_eff)
 [_cal_lo_clamp, _cal_hi_clamp] = f_cal_clamps(_symbol_key)
 float _adaptive_cal_up = math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, nz(_cal_up_state, _preset_sigma)))
 float _adaptive_cal_dn = math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, nz(_cal_dn_state, _preset_sigma)))
+float _adaptive_inner_up = math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, nz(_cal_inner_up_state, _preset_inner_sigma)))
+float _adaptive_inner_dn = math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, nz(_cal_inner_dn_state, _preset_inner_sigma)))
 float _next_cal_up = i_adapt_cal ? f_cal_warmup_blend(_preset_sigma, _adaptive_cal_up, _cal_sessions) : _preset_sigma
 float _next_cal_dn = i_adapt_cal ? f_cal_warmup_blend(_preset_sigma, _adaptive_cal_dn, _cal_sessions) : _preset_sigma
+float _next_inner_up = i_adapt_cal ? f_cal_warmup_blend(_preset_inner_sigma, _adaptive_inner_up, _cal_sessions) : _preset_inner_sigma
+float _next_inner_dn = i_adapt_cal ? f_cal_warmup_blend(_preset_inner_sigma, _adaptive_inner_dn, _cal_sessions) : _preset_inner_sigma
 float _eff_sigma = i_sigma
 
 float _base_move_live = na
@@ -539,12 +578,17 @@ if _intra and session.isfirstbar
     _base_move_lock := nz(_avg_range, _pred_anch * math.sqrt(math.max(_hv_eff, 1e-10)) * 2.0) * 0.5 * _var_ratio * _eff_sigma
     _cal_up_lock := _next_cal_up
     _cal_dn_lock := _next_cal_dn
+    _cal_inner_up_lock := _next_inner_up
+    _cal_inner_dn_lock := _next_inner_dn
     _cal_sessions_lock := _cal_sessions
     _raw_up_ref := _base_move_lock * _us_norm
     _raw_dn_ref := _base_move_lock * _ls_norm
     _pred_hi := _pred_anch + _raw_up_ref * _cal_up_lock
     _pred_lo := _pred_anch - _raw_dn_ref * _cal_dn_lock
     _pred_width := _pred_hi - _pred_lo
+    _inner_hi := _pred_anch + _raw_up_ref * _cal_inner_up_lock
+    _inner_lo := _pred_anch - _raw_dn_ref * _cal_inner_dn_lock
+    _inner_width := _inner_hi - _inner_lo
     _prev_cons := 0.0
 
 if not _intra
@@ -558,9 +602,14 @@ if not _intra
     _pred_hi := _pred_anch + _raw_up_live * _next_cal_up
     _pred_lo := _pred_anch - _raw_dn_live * _next_cal_dn
     _pred_width := _pred_hi - _pred_lo
+    _inner_hi := _pred_anch + _raw_up_live * _next_inner_up
+    _inner_lo := _pred_anch - _raw_dn_live * _next_inner_dn
+    _inner_width := _inner_hi - _inner_lo
 
 float _cal_up = _intra ? nz(_cal_up_lock, _next_cal_up) : _next_cal_up
 float _cal_dn = _intra ? nz(_cal_dn_lock, _next_cal_dn) : _next_cal_dn
+float _cal_inner_up = _intra ? nz(_cal_inner_up_lock, _next_inner_up) : _next_inner_up
+float _cal_inner_dn = _intra ? nz(_cal_inner_dn_lock, _next_inner_dn) : _next_inner_dn
 int _cal_sessions_used = _intra ? _cal_sessions_lock : _cal_sessions
 float _base_move = _intra ? _base_move_lock : _base_move_live
 float _raw_up_half = _intra ? _raw_up_ref : _raw_up_live
@@ -644,8 +693,8 @@ float _remaining_up = _intra and not na(_base_move) ? _base_move * _cal_up * mat
 float _remaining_dn = _intra and not na(_base_move) ? _base_move * _cal_dn * math.pow(_rem_var_frac, _hurst_exp) * _or_adj : na
 float _remaining_up_pts = _intra and not na(_remaining_up) ? _remaining_up * _us_norm_p : na
 float _remaining_dn_pts = _intra and not na(_remaining_dn) ? _remaining_dn * _ls_norm_p : na
-float _inner_hi = _intra and not na(_remaining_up_pts) ? close + _remaining_up_pts : na
-float _inner_lo = _intra and not na(_remaining_dn_pts) ? close - _remaining_dn_pts : na
+float _cone_hi = _intra and not na(_remaining_up_pts) ? close + _remaining_up_pts : na
+float _cone_lo = _intra and not na(_remaining_dn_pts) ? close - _remaining_dn_pts : na
 float _remaining_pts = _intra and not na(_remaining_up_pts) and not na(_remaining_dn_pts) ? _remaining_up_pts + _remaining_dn_pts : na
 
 // ================================================================
@@ -656,55 +705,74 @@ if _intra and not na(_consumed_pct)
     _prev_cons := _consumed_pct
 
 // ================================================================
-// BREACH RISK + REGIME PRESSURE METRICS
+// MOMENTUM ENGINE
 // ================================================================
-float _dist_up = not na(_pred_hi) and _pred_width > 0 ? (_pred_hi - close) / _pred_width : na
-float _dist_dn = not na(_pred_lo) and _pred_width > 0 ? (close - _pred_lo) / _pred_width : na
-float _nearest_dist = not na(_dist_up) and not na(_dist_dn) ? math.min(_dist_up, _dist_dn) : na
-float _nearest_band_pts = not na(_pred_hi) and not na(_pred_lo) ? math.min(math.abs(_pred_hi - close), math.abs(close - _pred_lo)) : na
+float _mom_5 = not na(close[5]) and close[5] > 0 ? (close - close[5]) / close[5] * 10000.0 : 0.0
+float _mom_15 = not na(close[15]) and close[15] > 0 ? (close - close[15]) / close[15] * 10000.0 : 0.0
+float _accel = not na(_mom_5[5]) ? _mom_5 - nz(_mom_5[5], 0.0) : 0.0
+bool _momentum_bullish = _mom_5 > 5.0 and _accel > 0.0
+bool _momentum_bearish = _mom_5 < -5.0 and _accel < 0.0
+bool _momentum_confirmed = _momentum_bullish or _momentum_bearish
 
-bool _breach_hi = not na(_pred_hi) and close > _pred_hi
-bool _breach_lo = not na(_pred_lo) and close < _pred_lo
-bool _at_upper = not na(_pred_hi) and high >= _pred_hi and _pred_hi > 0
-bool _at_lower = not na(_pred_lo) and low <= _pred_lo and _pred_lo > 0
-bool _above_anchor = not na(_pred_anch) and close > _pred_anch
-bool _below_anchor = not na(_pred_anch) and close < _pred_anch
-bool _inside_cone = _intra and not na(_inner_hi) and not na(_inner_lo) and close <= _inner_hi and close >= _inner_lo
+// ================================================================
+// DIRECTIONAL LEAN SCORE
+// ================================================================
+float _dir_lean = 0.0
+float _sv_total = math.max(_us_norm_p + _ls_norm_p, 1e-6)
+_dir_lean += (_us_norm_p - _ls_norm_p) / _sv_total * 30.0
+float _anch_dist = not na(_pred_anch) and _pred_anch > 0 ? (close - _pred_anch) / _pred_anch * 100.0 : 0.0
+_dir_lean += math.max(-25.0, math.min(25.0, _anch_dist * 50.0))
+float _up_consumed_pct = not na(_sess_hi) and not na(_pred_anch) and not na(_raw_up_half) and _raw_up_half > 0 ? math.max(_sess_hi - _pred_anch, 0.0) / math.max(_raw_up_half * _cal_up, 1e-9) * 100.0 : 0.0
+float _dn_consumed_pct = not na(_sess_lo) and not na(_pred_anch) and not na(_raw_dn_half) and _raw_dn_half > 0 ? math.max(_pred_anch - _sess_lo, 0.0) / math.max(_raw_dn_half * _cal_dn, 1e-9) * 100.0 : 0.0
+_dir_lean += math.max(-20.0, math.min(20.0, (_up_consumed_pct - _dn_consumed_pct) * 0.20))
+_dir_lean += math.max(-25.0, math.min(25.0, _mom_5 * 0.5))
+_dir_lean := math.max(-100.0, math.min(100.0, _dir_lean))
+string _dir_label = _dir_lean > 15.0 ? 'BULL' : _dir_lean < -15.0 ? 'BEAR' : 'FLAT'
+bool _dir_clear = math.abs(_dir_lean) > 15.0
 
-float _cons_adj = 0.0
-if not na(_consumed_pct)
-    if _consumed_pct > 100
-        _cons_adj := 35.0
-    else if _consumed_pct > 85
-        _cons_adj := 24.0
-    else if _consumed_pct > 65
-        _cons_adj := 12.0
-    else if _consumed_pct > 45
-        _cons_adj := 3.0
-    else if _consumed_pct > 25
-        _cons_adj := -6.0
-    else
-        _cons_adj := -15.0
-float _time_adj = not _intra ? 0.0 : _sess_fraction < 0.33 ? -8.0 : _sess_fraction < 0.67 ? 0.0 : 6.0
-float _vel_adj = _cons_velocity > 12 ? 8.0 : _cons_velocity > 6 ? 4.0 : _cons_velocity < 1 and _sess_fraction > 0.5 ? -5.0 : 0.0
-float _dist_adj = 0.0
-if not na(_nearest_dist)
-    if _nearest_dist < 0.05
-        _dist_adj := 15.0
-    else if _nearest_dist < 0.10
-        _dist_adj := 9.0
-    else if _nearest_dist < 0.20
-        _dist_adj := 4.0
-    else if _nearest_dist > 0.35
-        _dist_adj := -6.0
-float _hurst_adj = _H > 0.56 ? 5.0 : _H < 0.44 ? -4.0 : 0.0
-float _vov_adj = not na(_vov) and not na(_vov_med) and _vov > _vov_med * 1.15 ? 4.0 : 0.0
-float _jump_adj = _jfl > 0.5 ? 6.0 : 0.0
-float _anchor_adj = _below_anchor ? 2.0 : _above_anchor ? 1.0 : 0.0
-float _cone_adj = _intra and not na(_inner_hi) and not na(_inner_lo) ? (_inside_cone ? -2.0 : 5.0) : 0.0
+// ================================================================
+// BREAKOUT SCORE
+// ================================================================
+float _dist_inner_up = not na(_inner_hi) and _inner_width > 0 ? (_inner_hi - close) / _inner_width : na
+float _dist_inner_dn = not na(_inner_lo) and _inner_width > 0 ? (close - _inner_lo) / _inner_width : na
+float _nearest_inner = not na(_dist_inner_up) and not na(_dist_inner_dn) ? math.min(_dist_inner_up, _dist_inner_dn) : na
+float _dist_outer_up = not na(_pred_hi) and _pred_width > 0 ? (_pred_hi - close) / _pred_width : na
+float _dist_outer_dn = not na(_pred_lo) and _pred_width > 0 ? (close - _pred_lo) / _pred_width : na
+float _nearest_outer = not na(_dist_outer_up) and not na(_dist_outer_dn) ? math.min(_dist_outer_up, _dist_outer_dn) : na
+bool _beyond_inner = not na(_inner_hi) and not na(_inner_lo) and (close > _inner_hi or close < _inner_lo)
+bool _beyond_outer = not na(_pred_hi) and not na(_pred_lo) and (close > _pred_hi or close < _pred_lo)
 
-float _breach_raw = _preset_breach + _cons_adj + _time_adj + _vel_adj + _dist_adj + _hurst_adj + _vov_adj + _jump_adj + _anchor_adj + _cone_adj
-float _breach_prob = _intra ? math.max(3.0, math.min(95.0, _breach_raw)) : _preset_breach
+float _bk_base = 25.0
+float _prox_adj = 0.0
+if not na(_nearest_inner)
+    if _nearest_inner < 0.05
+        _prox_adj := 18.0
+    else if _nearest_inner < 0.10
+        _prox_adj := 10.0
+    else if _nearest_inner < 0.20
+        _prox_adj := 4.0
+    else if _nearest_inner > 0.40
+        _prox_adj := -8.0
+float _beyond_adj = _beyond_inner ? 15.0 : 0.0
+float _beyond_outer_adj = _beyond_outer ? 10.0 : 0.0
+float _mom_adj = math.abs(_mom_5) > 20 ? 10.0 : math.abs(_mom_5) > 10 ? 6.0 : math.abs(_mom_5) > 5 ? 3.0 : -3.0
+float _accel_adj = _accel > 2.0 ? 5.0 : _accel < -2.0 ? -4.0 : 0.0
+float _hurst_bk = _H > 0.56 ? 8.0 : _H < 0.44 ? -6.0 : 0.0
+float _time_bk = _sess_fraction < 0.25 ? 6.0 : _sess_fraction < 0.50 ? 2.0 : _sess_fraction > 0.75 ? -10.0 : -3.0
+float _vel_bk = _cons_velocity > 12 ? 6.0 : _cons_velocity > 6 ? 3.0 : _cons_velocity < 2 and _sess_fraction > 0.4 ? -6.0 : 0.0
+float _jump_bk = _jfl > 0.5 ? 6.0 : 0.0
+float _vov_bk = not na(_vov) and not na(_vov_med) and _vov > _vov_med * 1.15 ? 4.0 : 0.0
+float _breakout_raw = _bk_base + _prox_adj + _beyond_adj + _beyond_outer_adj + _mom_adj + _accel_adj + _hurst_bk + _time_bk + _vel_bk + _jump_bk + _vov_bk
+float _breakout_score = _intra ? math.max(0.0, math.min(100.0, _breakout_raw)) : 0.0
+
+// ================================================================
+// ENTRY QUALITY GRADE
+// ================================================================
+float _time_quality = _sess_fraction < 0.25 ? 80.0 : _sess_fraction < 0.50 ? 60.0 : _sess_fraction < 0.70 ? 30.0 : 10.0
+float _mom_quality = math.abs(_mom_5) > 15 ? 70.0 : math.abs(_mom_5) > 8 ? 45.0 : 15.0
+float _entry_raw = _breakout_score * 0.40 + math.abs(_dir_lean) * 0.30 + _time_quality * 0.20 + _mom_quality * 0.10
+string _entry_grade = _entry_raw >= 70.0 ? 'A' : _entry_raw >= 55.0 ? 'B' : _entry_raw >= 40.0 ? 'C' : _entry_raw >= 25.0 ? 'D' : 'F'
+color _entry_col = _entry_grade == 'A' ? color.rgb(0, 220, 160) : _entry_grade == 'B' ? color.rgb(0, 180, 220) : _entry_grade == 'C' ? color.rgb(255, 170, 0) : color.rgb(255, 50, 80)
 
 // ================================================================
 // MODEL CONFIDENCE
@@ -733,28 +801,28 @@ if not _bars_ready
 float _model_confidence = math.max(0.0, math.min(100.0, _confidence))
 
 // ================================================================
-// REGIME ENGINE
+// BUYER REGIME ENGINE
 // ================================================================
-bool _is_breach = _breach_hi or _breach_lo
-bool _is_pressure = _intra and not _is_breach and ((not na(_nearest_dist) and _nearest_dist < 0.10) or _breach_prob > 65)
-bool _is_trending = _intra and not _is_breach and (nz(_consumed_pct, 0.0) > 65 or _cons_velocity > 12 or (_H > 0.56 and nz(_consumed_pct, 0.0) > 55))
-bool _is_consolidating = _intra and not _is_breach and not _is_pressure and _past_third and nz(_consumed_pct, 0.0) < 35 and _cons_velocity < 3 and _breach_prob < 30
+bool _is_breakout = _intra and _beyond_inner
+bool _is_loading = _intra and not _is_breakout and ((not na(_nearest_inner) and _nearest_inner < 0.10) or _breakout_score > 55.0)
+bool _is_riding = _intra and not _is_breakout and not _is_loading and (nz(_consumed_pct, 0.0) > 55 or _cons_velocity > 10 or (_H > 0.55 and nz(_consumed_pct, 0.0) > 45))
+bool _is_dead = _intra and not _is_breakout and not _is_loading and not _is_riding and _past_third and nz(_consumed_pct, 0.0) < 30 and _cons_velocity < 2 and _breakout_score < 20
 
-string _raw_regime = 'NORMAL'
+string _raw_regime = 'WATCH'
 if not _intra
     _raw_regime := 'DAILY'
-else if _is_breach
-    _raw_regime := 'BREACH'
-else if _is_pressure
-    _raw_regime := 'PRESSURE'
+else if _is_breakout
+    _raw_regime := 'BREAKOUT'
+else if _is_loading
+    _raw_regime := 'LOADING'
 else if _sess_fraction < 0.33
-    _raw_regime := 'ACCUMULATING'
-else if _is_trending
-    _raw_regime := 'TRENDING'
-else if _is_consolidating
-    _raw_regime := 'CONSOLIDATING'
+    _raw_regime := 'BUILDING'
+else if _is_riding
+    _raw_regime := 'RIDING'
+else if _is_dead
+    _raw_regime := 'DEAD'
 
-var string _regime_prev = 'NORMAL'
+var string _regime_prev = 'WATCH'
 var int _regime_dwell_bars = 0
 var int _regime_downgrade_wait = 0
 string _regime = _raw_regime
@@ -814,72 +882,118 @@ if _intra and session.islastbar and not na(_pred_anch) and not na(_raw_up_ref) a
     if i_adapt_cal and _cal_sessions_live >= 20
         float _target_up = nz(_cal_up_state, _preset_sigma)
         float _target_dn = nz(_cal_dn_state, _preset_sigma)
-        float _raw_q_up = f_weighted_quantile(_up_ratio_hist, i_target, _preset_sigma, i_decay)
-        float _raw_q_dn = f_weighted_quantile(_dn_ratio_hist, i_target, _preset_sigma, i_decay)
+        float _raw_q_up = f_weighted_quantile(_up_ratio_hist, i_target, _preset_sigma, _cal_decay_eff)
+        float _raw_q_dn = f_weighted_quantile(_dn_ratio_hist, i_target, _preset_sigma, _cal_decay_eff)
         float _step_up = (_raw_q_up - _target_up) * _cal_alpha_effective
         float _step_dn = (_raw_q_dn - _target_dn) * _cal_alpha_effective
         _step_up := math.max(math.min(_step_up, 0.05), -0.05)
         _step_dn := math.max(math.min(_step_dn, 0.05), -0.05)
         _cal_up_state := math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, _target_up + _step_up))
         _cal_dn_state := math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, _target_dn + _step_dn))
+
+        float _target_inner_up = nz(_cal_inner_up_state, _preset_inner_sigma)
+        float _target_inner_dn = nz(_cal_inner_dn_state, _preset_inner_sigma)
+        float _raw_q_inner_up = f_weighted_quantile(_up_ratio_hist, i_inner_target, _preset_inner_sigma, _cal_decay_eff)
+        float _raw_q_inner_dn = f_weighted_quantile(_dn_ratio_hist, i_inner_target, _preset_inner_sigma, _cal_decay_eff)
+        float _step_inner_up = (_raw_q_inner_up - _target_inner_up) * _cal_alpha_effective
+        float _step_inner_dn = (_raw_q_inner_dn - _target_inner_dn) * _cal_alpha_effective
+        _step_inner_up := math.max(math.min(_step_inner_up, 0.05), -0.05)
+        _step_inner_dn := math.max(math.min(_step_inner_dn, 0.05), -0.05)
+        _cal_inner_up_state := math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, _target_inner_up + _step_inner_up))
+        _cal_inner_dn_state := math.max(_cal_lo_clamp, math.min(_cal_hi_clamp, _target_inner_dn + _step_inner_dn))
     else
         _cal_up_state := _preset_sigma
         _cal_dn_state := _preset_sigma
+        _cal_inner_up_state := _preset_inner_sigma
+        _cal_inner_dn_state := _preset_inner_sigma
+
+// ================================================================
+// EMPIRICAL BREAKOUT CALIBRATION
+// ================================================================
+var float[] _bk_cal_hits = array.new_float(10, 0.0)
+var float[] _bk_cal_total = array.new_float(10, 0.0)
+var float _session_max_bk_score = 0.0
+
+if _intra and session.isfirstbar
+    _session_max_bk_score := _breakout_score
+else if _intra
+    _session_max_bk_score := math.max(_session_max_bk_score, _breakout_score)
+
+if _intra and session.islastbar
+    int _decile = math.min(9, int(math.floor(_session_max_bk_score / 10.0)))
+    if _decile >= 0 and _decile < 10
+        float _bk_decay = 0.994
+        for _di = 0 to 9
+            array.set(_bk_cal_hits, _di, f_arr_get_float(_bk_cal_hits, _di, 0.0) * _bk_decay)
+            array.set(_bk_cal_total, _di, f_arr_get_float(_bk_cal_total, _di, 0.0) * _bk_decay)
+        array.set(_bk_cal_total, _decile, f_arr_get_float(_bk_cal_total, _decile, 0.0) + 1.0)
+        bool _did_exceed_inner = not na(_inner_hi) and not na(_inner_lo) and (_sess_hi > _inner_hi or _sess_lo < _inner_lo)
+        if _did_exceed_inner
+            array.set(_bk_cal_hits, _decile, f_arr_get_float(_bk_cal_hits, _decile, 0.0) + 1.0)
+
+int _curr_decile = _intra ? math.min(9, int(math.floor(_breakout_score / 10.0))) : 0
+float _empirical_hit_rate = 0.0
+float _dec_total = f_arr_get_float(_bk_cal_total, _curr_decile, 0.0)
+if _dec_total >= 5.0
+    _empirical_hit_rate := f_arr_get_float(_bk_cal_hits, _curr_decile, 0.0) / _dec_total * 100.0
 
 // ================================================================
 // PLOTTING — PREMIUM INSTITUTIONAL VISUALIZATION
 // ================================================================
-color c_band = color.rgb(60, 130, 220)
-color c_cone = color.rgb(0, 220, 160)
-color c_cone_fill = color.rgb(0, 200, 150)
+color c_outer = color.rgb(60, 130, 220)
+color c_inner = color.rgb(0, 200, 190)
+color c_zone = color.rgb(0, 210, 180)
+color c_cone = color.rgb(120, 220, 255)
 color c_cons_lo = color.rgb(40, 100, 200, 85)
 color c_cons_mid = color.rgb(255, 170, 0, 70)
 color c_cons_hi = color.rgb(255, 50, 80, 55)
-color c_cons_breach = color.rgb(255, 30, 60, 30)
-color c_cons_warn = color.rgb(255, 170, 0, 40)
-color c_consolidating = color.rgb(40, 140, 255)
-color c_trending = color.rgb(255, 50, 80)
-color c_pressure = color.rgb(255, 170, 0)
-color c_normal = color.rgb(180, 180, 190)
+color c_cons_tail = color.rgb(255, 30, 60, 30)
+color c_loading = color.rgb(255, 170, 0)
+color c_breakout = color.rgb(0, 220, 160)
+color c_riding = color.rgb(0, 180, 220)
+color c_dead = color.rgb(150, 155, 170)
+color c_watch = color.rgb(180, 180, 190)
+color c_bear = color.rgb(255, 50, 80)
 color c_anchor = color.rgb(255, 191, 36, 40)
-color c_good = color.rgb(0, 220, 160)
+color c_good = c_breakout
+int _outer_line_w = i_buyer_pro ? 2 : 3
 
 color _cons_fill = na
 if _intra and not na(_consumed_pct)
-    _cons_fill := _consumed_pct > 100 ? c_cons_breach : _consumed_pct > 75 ? c_cons_hi : _consumed_pct > 50 ? c_cons_mid : c_cons_lo
+    _cons_fill := _consumed_pct > 100 ? c_cons_tail : _consumed_pct > 75 ? c_cons_hi : _consumed_pct > 50 ? c_cons_mid : c_cons_lo
 
-p_hi = plot(_pred_hi, 'Range High', color.new(c_band, 20), 2)
-p_lo = plot(_pred_lo, 'Range Low', color.new(c_band, 20), 2)
+p_hi = plot(_pred_hi, 'Fortress High', color.new(c_outer, 5), _outer_line_w)
+p_lo = plot(_pred_lo, 'Fortress Low', color.new(c_outer, 5), _outer_line_w)
+p_inner_hi = plot(_inner_hi, 'Inner High', color.new(c_inner, 0), 2)
+p_inner_lo = plot(_inner_lo, 'Inner Low', color.new(c_inner, 0), 2)
 
-float _cone_hi_val = i_cone and _intra ? _inner_hi : na
-float _cone_lo_val = i_cone and _intra ? _inner_lo : na
-p_conehi = plot(_cone_hi_val, 'Cone Hi', color.new(c_cone, 10), 2, plot.style_linebr)
-p_conelo = plot(_cone_lo_val, 'Cone Lo', color.new(c_cone, 10), 2, plot.style_linebr)
+float _cone_hi_val = i_cone and _intra ? _cone_hi : na
+float _cone_lo_val = i_cone and _intra ? _cone_lo : na
+p_conehi = plot(_cone_hi_val, 'Cone High', color.new(c_cone, 10), 2, plot.style_linebr)
+p_conelo = plot(_cone_lo_val, 'Cone Low', color.new(c_cone, 10), 2, plot.style_linebr)
 
-fill(p_hi, p_lo, color.new(c_band, 95), title='Full Range Light')
-fill(p_conehi, p_conelo, i_cone ? color.new(c_cone_fill, 80) : na, title='Cone Core')
-fill(p_hi, p_conehi, i_cone ? color.new(c_band, 90) : na, title='Upper Fade Zone')
-fill(p_conelo, p_lo, i_cone ? color.new(c_band, 90) : na, title='Lower Fade Zone')
+fill(p_hi, p_inner_hi, color = i_buyer_pro ? na : color.new(c_zone, 90), title='Upper Opportunity Zone')
+fill(p_inner_lo, p_lo, color = i_buyer_pro ? na : color.new(c_zone, 90), title='Lower Opportunity Zone')
+fill(p_inner_hi, p_inner_lo, color = i_buyer_pro ? na : color.new(c_inner, 94), title='Inner Trigger Core')
+fill(p_conehi, p_conelo, color = i_buyer_pro ? na : (i_cone ? color.new(c_cone, 88) : na), title='Remaining Cone')
 
 color _bar_col = na
-if _is_breach
-    _bar_col := color.new(c_trending, 0)
-else if _regime == 'PRESSURE'
-    _bar_col := color.new(c_pressure, 0)
-else if _at_upper or _at_lower
-    _bar_col := c_cons_warn
-barcolor(_bar_col, title='Boundary Bar Color')
+if _beyond_inner and _momentum_confirmed
+    _bar_col := color.new(c_breakout, 0)
+else if _is_loading
+    _bar_col := color.new(c_loading, 0)
+barcolor(_bar_col, title='Opportunity Bar Color')
 
-plot(i_anch ? _pred_anch : na, 'Anchor', c_anchor, 1, plot.style_line)
+plot(i_anch and not i_buyer_pro ? _pred_anch : na, 'Anchor', c_anchor, 1, plot.style_line)
 
-p_sh = plot(i_cons and _intra ? _sess_hi : na, 'Session High', color.new(c_cons_mid, 60), 1, plot.style_linebr)
-p_sl = plot(i_cons and _intra ? _sess_lo : na, 'Session Low', color.new(c_cons_mid, 60), 1, plot.style_linebr)
-fill(p_sh, p_sl, i_cons ? _cons_fill : na, title='Consumed Range')
+p_sh = plot((i_cons and not i_buyer_pro) and _intra ? _sess_hi : na, 'Session High', color.new(c_cons_mid, 60), 1, plot.style_linebr)
+p_sl = plot((i_cons and not i_buyer_pro) and _intra ? _sess_lo : na, 'Session Low', color.new(c_cons_mid, 60), 1, plot.style_linebr)
+fill(p_sh, p_sl, color = i_buyer_pro ? na : (i_cons ? _cons_fill : na), title='Consumed Range')
 
 var label[] _width_labels = array.new_label(0)
-if i_wlabel and _intra and session.isfirstbar and not na(_pred_hi) and not na(_pred_lo)
+if i_wlabel and not i_buyer_pro and _intra and session.isfirstbar and not na(_pred_hi) and not na(_pred_lo)
     int n_stk = int(math.round(_pred_width / _strike_int))
-    string w_txt = str.tostring(_pred_width, '#') + ' pts\n' + str.tostring(n_stk) + ' strikes'
+    string w_txt = 'Fortress ' + str.tostring(_pred_width, '#') + ' pts\n' + str.tostring(n_stk) + ' strikes'
     color w_col = _pred_width > 350 ? color.rgb(255, 100, 80) : _pred_width < 200 ? color.rgb(0, 200, 160) : color.rgb(180, 180, 200)
     label _w_lbl = label.new(bar_index, _pred_hi, w_txt,
          style=label.style_label_down, color=color.rgb(10, 10, 20, 20),
@@ -889,31 +1003,19 @@ if i_wlabel and _intra and session.isfirstbar and not na(_pred_hi) and not na(_p
         label.delete(array.shift(_width_labels))
 
 var label _regime_lbl = na
-if _intra and barstate.islast
+if _intra and not i_buyer_pro and barstate.islast
     if not na(_regime_lbl)
         label.delete(_regime_lbl)
-    string r_txt = '⚪ NORMAL\n' + str.tostring(_consumed_pct, '#.#') + '%'
-    if _regime == 'BREACH'
-        r_txt := '⛔ BREACH · Risk Off\n' + str.tostring(_breach_prob, '#.#') + '%'
-    else if _regime == 'PRESSURE'
-        r_txt := '🟠 PRESSURE · Edge Risk\n' + str.tostring(_breach_prob, '#.#') + '%'
-    else if _regime == 'TRENDING'
-        r_txt := '🔴 TREND · Direction\n' + str.tostring(_consumed_pct, '#.#') + '%'
-    else if _regime == 'CONSOLIDATING'
-        r_txt := '🔵 CONSOL · Sell Prem\n' + str.tostring(_consumed_pct, '#.#') + '%'
-    else if _regime == 'ACCUMULATING'
-        r_txt := '⏳ ACCUM\n' + str.tostring(_consumed_pct, '#.#') + '%'
-    color r_col = c_normal
-    if _regime == 'BREACH'
-        r_col := c_trending
-    else if _regime == 'PRESSURE'
-        r_col := c_pressure
-    else if _regime == 'TRENDING'
-        r_col := c_trending
-    else if _regime == 'CONSOLIDATING'
-        r_col := c_consolidating
-    else if _regime == 'ACCUMULATING'
-        r_col := c_cons_warn
+    string r_txt = _regime + '\nBKO ' + str.tostring(_breakout_score, '#.#')
+    color r_col = c_watch
+    if _regime == 'BREAKOUT'
+        r_col := c_breakout
+    else if _regime == 'LOADING'
+        r_col := c_loading
+    else if _regime == 'RIDING'
+        r_col := c_riding
+    else if _regime == 'DEAD'
+        r_col := c_dead
     _regime_lbl := label.new(bar_index + 3, _pred_anch, r_txt,
          style=label.style_label_left, color=color.rgb(10, 10, 20, 30),
          textcolor=r_col, size=size.normal)
@@ -921,17 +1023,28 @@ else if barstate.islast and not na(_regime_lbl)
     label.delete(_regime_lbl)
     _regime_lbl := na
 
+var label _dir_lbl = na
+if _intra and i_buyer_pro and barstate.islast and _dir_clear
+    if not na(_dir_lbl)
+        label.delete(_dir_lbl)
+    float _dir_pad = math.max(nz(_pred_width, high - low) * 0.03, syminfo.mintick * 10)
+    bool _dir_bull = _dir_lean > 15.0
+    string _dir_txt = _dir_bull ? '▲' : '▼'
+    float _dir_y = _dir_bull ? high + _dir_pad : low - _dir_pad
+    color _dir_col = _dir_bull ? c_breakout : c_bear
+    _dir_lbl := label.new(bar_index, _dir_y, _dir_txt,
+         style=label.style_none, color=color.rgb(0, 0, 0, 100), textcolor=_dir_col, size=size.large)
+else if barstate.islast and not na(_dir_lbl)
+    label.delete(_dir_lbl)
+    _dir_lbl := na
+
 color _regime_bg = na
 if _intra
-    if _regime == 'BREACH'
-        _regime_bg := color.new(c_trending, 92)
-    else if _regime == 'PRESSURE'
-        _regime_bg := color.new(c_pressure, 94)
-    else if _regime == 'TRENDING'
-        _regime_bg := color.new(c_trending, 95)
-    else if _regime == 'CONSOLIDATING'
-        _regime_bg := color.new(c_consolidating, 95)
-bgcolor(_regime_bg, title='Regime Background')
+    if _regime == 'BREAKOUT'
+        _regime_bg := color.new(c_breakout, 90)
+    else if _regime == 'LOADING'
+        _regime_bg := color.new(c_loading, 95)
+bgcolor(i_buyer_pro ? na : _regime_bg, title='Buyer Regime Background')
 
 // ================================================================
 // SIGNAL STRIKES — Dynamic ATM + remaining boundary strikes
@@ -953,9 +1066,9 @@ if i_strikes and _intra and not na(_remaining_up_pts) and not na(_remaining_dn_p
     _sig1_hi := math.round(_cone_up / _si) * _si
     _sig1_lo := math.round(_cone_dn / _si) * _si
 
-plot(i_strikes and f_in_range(_atm_stk) ? _atm_stk : na, 'ATM Strike', color.new(color.rgb(255, 191, 36), 30), 2, plot.style_linebr)
-plot(i_strikes and f_in_range(_sig1_hi) ? _sig1_hi : na, '+1σ Rem', color.rgb(0, 200, 150, 50), 1, plot.style_linebr)
-plot(i_strikes and f_in_range(_sig1_lo) ? _sig1_lo : na, '-1σ Rem', color.rgb(0, 200, 150, 50), 1, plot.style_linebr)
+plot((i_strikes and not i_buyer_pro) and f_in_range(_atm_stk) ? _atm_stk : na, 'ATM Strike', color.new(color.rgb(255, 191, 36), 30), 2, plot.style_linebr)
+plot((i_strikes and not i_buyer_pro) and f_in_range(_sig1_hi) ? _sig1_hi : na, '+Cone Rem', color.rgb(0, 200, 150, 50), 1, plot.style_linebr)
+plot((i_strikes and not i_buyer_pro) and f_in_range(_sig1_lo) ? _sig1_lo : na, '-Cone Rem', color.rgb(0, 200, 150, 50), 1, plot.style_linebr)
 
 // ================================================================
 // MODEL STATE TABLE
@@ -976,99 +1089,137 @@ f_section(table tbl, int r, string title) =>
          text_color=color.rgb(220, 225, 235), text_size=size.small,
          bgcolor=color.rgb(18, 20, 28, 35), text_halign=text.align_right)
 
-var table _T = table.new(position.top_right, 2, 23,
+f_clear_row(table tbl, int r) =>
+    table.cell(tbl, 0, r, '', bgcolor=na)
+    table.cell(tbl, 1, r, '', bgcolor=na)
+
+var table _T = table.new(position.top_right, 2, 24,
      bgcolor=color.rgb(10, 10, 15, 10),
      frame_color=color.rgb(30, 30, 45, 0), frame_width=1,
      border_color=color.rgb(40, 40, 55, 50), border_width=1)
 
 if i_tbl and barstate.islast
     float _ann = math.sqrt(math.max(_hv, 0.0) * 252.0) * 100.0
-    float _vov_ann = _vov * math.sqrt(252.0) * 100.0
-    int _n_strikes = _pred_width > 0 ? int(math.round(_pred_width / _strike_int)) : 0
-
-    color _reg_col = c_normal
-    if _regime == 'BREACH'
-        _reg_col := c_trending
-    else if _regime == 'PRESSURE'
-        _reg_col := c_pressure
-    else if _regime == 'TRENDING'
-        _reg_col := c_trending
-    else if _regime == 'CONSOLIDATING'
-        _reg_col := c_consolidating
-    else if _regime == 'ACCUMULATING'
-        _reg_col := c_cons_warn
-    string _reg_sig = '⚪ NORMAL'
-    if _regime == 'BREACH'
-        _reg_sig := '⛔ BREACH · Risk Off'
-    else if _regime == 'PRESSURE'
-        _reg_sig := '🟠 PRESSURE · Edge Risk'
-    else if _regime == 'TRENDING'
-        _reg_sig := '🔴 TREND · Direction'
-    else if _regime == 'CONSOLIDATING'
-        _reg_sig := '🔵 CONSOL · Sell Prem'
-    else if _regime == 'ACCUMULATING'
-        _reg_sig := '⏳ ACCUM'
+    color _reg_col = c_watch
+    if _regime == 'BREAKOUT'
+        _reg_col := c_breakout
+    else if _regime == 'LOADING'
+        _reg_col := c_loading
+    else if _regime == 'RIDING'
+        _reg_col := c_riding
+    else if _regime == 'DEAD'
+        _reg_col := c_dead
     else if _regime == 'DAILY'
-        _reg_sig := '📊 DAILY'
-    color _conf_col = _model_confidence >= 80 ? c_good : _model_confidence >= 60 ? c_pressure : c_trending
-    color _bpc = _breach_prob > 65 ? c_trending : _breach_prob > 35 ? c_pressure : c_good
-    color _cpc = c_normal
-    if not na(_consumed_pct)
-        if _consumed_pct > 100
-            _cpc := c_trending
-        else if _consumed_pct > 75
-            _cpc := c_pressure
-        else if _consumed_pct > 50
-            _cpc := color.rgb(255, 220, 100)
-        else
-            _cpc := c_good
-    color _cal_col = i_adapt_cal and _cal_sessions_used >= 20 ? c_good : c_pressure
-    color _ivrc = _use_vix and not na(_vix_raw) ? (_iv_rv_factor > 1.15 ? c_pressure : _iv_rv_factor < 0.85 ? c_good : c_normal) : c_normal
-    color _hcol = _H > 0.56 ? c_trending : _H < 0.44 ? c_good : c_normal
-    color _ols_col = _ols_active ? c_good : c_pressure
+        _reg_col := c_watch
+    color _dir_col = _dir_lean > 15 ? c_breakout : _dir_lean < -15 ? c_bear : c_watch
+    color _bk_col = _breakout_score >= 80 ? c_breakout : _breakout_score >= 65 ? c_riding : _breakout_score >= 45 ? c_loading : _breakout_score >= 25 ? color.rgb(255, 220, 100) : c_dead
+    color _near_col = not na(_nearest_inner) and _nearest_inner < 0.10 ? c_loading : c_watch
+    color _emp_col = _dec_total >= 5.0 ? (_empirical_hit_rate > 50 ? c_breakout : _empirical_hit_rate >= 30 ? color.rgb(255, 220, 100) : c_bear) : c_watch
+    color _mom_col = math.abs(_mom_5) > 10 ? (_mom_5 > 0 ? c_breakout : c_bear) : c_watch
+    color _accel_col = _accel > 0 ? c_breakout : _accel < 0 ? c_bear : c_watch
+    color _cal_col = i_adapt_cal and _cal_sessions_used >= 20 ? c_good : c_loading
+    color _conf_col = _model_confidence >= 80 ? c_good : _model_confidence >= 60 ? c_loading : c_bear
+    color _hcol = _H > 0.56 ? c_riding : _H < 0.44 ? c_dead : c_watch
+    color _ols_col = _ols_active ? c_good : c_loading
+    string _dir_arrow = _dir_lean > 15 ? '▲' : _dir_lean < -15 ? '▼' : ''
+    string _dir_val = _dir_label + ' ' + (_dir_lean > 0 ? '+' : '') + str.tostring(_dir_lean, '#.1')
+    string _emp_val = _dec_total >= 5.0 ? str.tostring(_empirical_hit_rate, '#.#') + '% (' + str.tostring(_dec_total, '#') + ' obs)' : 'Warmup'
+    string _hit_val = _dec_total >= 5.0 ? str.tostring(_empirical_hit_rate, '#.#') + '%' : '—'
+    string _accel_txt = _accel > 0 ? '▲ ' + str.tostring(_accel, '#.1') : _accel < 0 ? '▼ ' + str.tostring(math.abs(_accel), '#.1') : 'FLAT 0.0'
 
-    f_section(_T, 0, 'STATE')
-    f_row(_T, 1, 'REGIME', _reg_sig, _reg_col)
-    f_row(_T, 2, 'CONF', str.tostring(_model_confidence, '#') , _conf_col)
-    f_row(_T, 3, 'Breach %', str.tostring(_breach_prob, '#.#') + '%', _bpc)
-    f_row(_T, 4, 'Consumed %', na(_consumed_pct) ? '—' : str.tostring(_consumed_pct, '#.#') + '%', _cpc)
+    if i_buyer_pro
+        string _summary = _regime + (_dir_arrow == '' ? '' : ' ' + _dir_arrow) + ' ' + _dir_label + ' ' + (_dir_lean > 0 ? '+' : '') + str.tostring(_dir_lean, '#.0')
+        string _inner_txt = not na(_inner_lo) and not na(_inner_hi) ? str.tostring(_inner_lo, '#.##') + ' - ' + str.tostring(_inner_hi, '#.##') + ' (' + str.tostring(i_inner_target * 100.0, '#.#') + '%)' : 'N/A'
+        string _fort_txt = not na(_pred_lo) and not na(_pred_hi) ? str.tostring(_pred_lo, '#.##') + ' - ' + str.tostring(_pred_hi, '#.##') + ' (' + str.tostring(i_target * 100.0, '#.#') + '%)' : 'N/A'
+        string _rem_txt = na(_remaining_up_pts) or na(_remaining_dn_pts) ? 'N/A' : '▲' + str.tostring(_remaining_up_pts, '#.#') + '  ▼' + str.tostring(_remaining_dn_pts, '#.#') + ' pts'
+        table.cell(_T, 0, 0, _summary,
+             text_color=_reg_col, text_size=size.small,
+             bgcolor=color.rgb(18, 20, 28, 35), text_halign=text.align_left)
+        table.cell(_T, 1, 0, '[' + _entry_grade + ']',
+             text_color=_entry_col, text_size=size.small,
+             bgcolor=color.rgb(18, 20, 28, 35), text_halign=text.align_right)
+        table.cell(_T, 0, 1, 'Bkout ' + str.tostring(_breakout_score, '#.#'),
+             text_color=_bk_col, text_size=size.small,
+             bgcolor=na, text_halign=text.align_left)
+        table.cell(_T, 1, 1, 'Hit ' + _hit_val,
+             text_color=_emp_col, text_size=size.small,
+             bgcolor=na, text_halign=text.align_right)
+        table.cell(_T, 0, 2, 'Inner',
+             text_color=color.rgb(140, 145, 165), text_size=size.small,
+             bgcolor=na, text_halign=text.align_left)
+        table.cell(_T, 1, 2, _inner_txt,
+             text_color=c_inner, text_size=size.small,
+             bgcolor=na, text_halign=text.align_right)
+        table.cell(_T, 0, 3, 'Fort',
+             text_color=color.rgb(140, 145, 165), text_size=size.small,
+             bgcolor=na, text_halign=text.align_left)
+        table.cell(_T, 1, 3, _fort_txt,
+             text_color=c_outer, text_size=size.small,
+             bgcolor=na, text_halign=text.align_right)
+        table.cell(_T, 0, 4, 'Rem',
+             text_color=color.rgb(140, 145, 165), text_size=size.small,
+             bgcolor=na, text_halign=text.align_left)
+        table.cell(_T, 1, 4, _rem_txt,
+             text_color=c_cone, text_size=size.small,
+             bgcolor=na, text_halign=text.align_right)
+        table.cell(_T, 0, 5, 'Consumed ' + (na(_consumed_pct) ? 'N/A' : str.tostring(_consumed_pct, '#.#') + '%'),
+             text_color=_near_col, text_size=size.small,
+             bgcolor=na, text_halign=text.align_left)
+        table.cell(_T, 1, 5, 'Vel ' + str.tostring(_cons_velocity, '#.##'),
+             text_color=_accel_col, text_size=size.small,
+             bgcolor=na, text_halign=text.align_right)
+        table.cell(_T, 0, 6, 'Hurst ' + str.tostring(_H, '#.###'),
+             text_color=_hcol, text_size=size.small,
+             bgcolor=na, text_halign=text.align_left)
+        table.cell(_T, 1, 6, 'Mom ' + str.tostring(_mom_5, '#.1') + ' bps',
+             text_color=_mom_col, text_size=size.small,
+             bgcolor=na, text_halign=text.align_right)
+        for i = 7 to 23
+            f_clear_row(_T, i)
+    else
+        f_section(_T, 0, 'STATE')
+        f_row(_T, 1, 'Regime', _regime, _reg_col)
+        f_row(_T, 2, 'Direction', _dir_val, _dir_col)
+        f_row(_T, 3, 'Entry', _entry_grade, _entry_col)
+        f_row(_T, 4, 'Breakout', str.tostring(_breakout_score, '#.#'), _bk_col)
+        f_row(_T, 5, 'Empirical', _emp_val, _emp_col)
 
-    f_section(_T, 5, 'RANGE')
-    f_row(_T, 6, 'Anchor', str.tostring(nz(_pred_anch, 0.0), '#.##'), color.rgb(255, 191, 36))
-    f_row(_T, 7, 'Pred Range', str.tostring(nz(_pred_width, 0.0), '#.#') + ' pts · ' + str.tostring(_n_strikes) + ' stk', color.rgb(230, 230, 240))
-    f_row(_T, 8, 'Rem Up/DN', na(_remaining_up_pts) or na(_remaining_dn_pts) ? '—' : str.tostring(_remaining_up_pts, '#.#') + ' / ' + str.tostring(_remaining_dn_pts, '#.#'), c_cone)
-    f_row(_T, 9, 'Near Band', na(_nearest_dist) ? '—' : str.tostring(_nearest_dist * 100.0, '#.#') + '%', _bpc)
+        f_section(_T, 6, 'RANGE')
+        f_row(_T, 7, 'Anchor', str.tostring(nz(_pred_anch, 0.0), '#.##'), color.rgb(255, 191, 36))
+        f_row(_T, 8, 'Inner', not na(_inner_lo) and not na(_inner_hi) ? str.tostring(_inner_lo, '#.##') + ' to ' + str.tostring(_inner_hi, '#.##') + ' (' + str.tostring(i_inner_target * 100.0, '#.#') + '%)' : 'N/A', c_inner)
+        f_row(_T, 9, 'Fortress', not na(_pred_lo) and not na(_pred_hi) ? str.tostring(_pred_lo, '#.##') + ' to ' + str.tostring(_pred_hi, '#.##') + ' (' + str.tostring(i_target * 100.0, '#.#') + '%)' : 'N/A', c_outer)
+        f_row(_T, 10, 'Near Inner', na(_nearest_inner) ? 'N/A' : str.tostring(_nearest_inner * 100.0, '#.#') + '%', _near_col)
 
-    f_section(_T, 10, 'CALIBRATION')
-    f_row(_T, 11, 'Preset', str.tostring(_preset_sigma, '#.##') + 'σ', _recognized_symbol ? c_normal : c_pressure)
-    f_row(_T, 12, 'UP Cal', str.tostring(_cal_up, '#.##'), _cal_col)
-    f_row(_T, 13, 'DN Cal', str.tostring(_cal_dn, '#.##'), _cal_col)
-    f_row(_T, 14, 'Target', str.tostring(i_target * 100.0, '#.#') + '%', c_normal)
-    f_row(_T, 15, 'Cal Sess', str.tostring(_cal_sessions_used) + ' / ' + str.tostring(i_cal_len), _cal_col)
+        f_section(_T, 11, 'MOMENTUM')
+        f_row(_T, 12, 'Velocity', str.tostring(_mom_5, '#.1') + ' bps', _mom_col)
+        f_row(_T, 13, 'Accel', _accel_txt, _accel_col)
+        f_row(_T, 14, 'Consumed', na(_consumed_pct) ? 'N/A' : str.tostring(_consumed_pct, '#.#') + '%', _near_col)
+        f_row(_T, 15, 'Remaining', na(_remaining_up_pts) or na(_remaining_dn_pts) ? 'N/A' : str.tostring(_remaining_up_pts, '#.#') + ' / ' + str.tostring(_remaining_dn_pts, '#.#'), c_cone)
 
-    f_section(_T, 16, 'VOL MODEL')
-    f_row(_T, 17, 'HAR Vol', str.tostring(_ann, '#.##') + '%', color.rgb(255, 191, 36))
-    f_row(_T, 18, 'Hurst', str.tostring(_H, '#.###'), _hcol)
-    f_row(_T, 19, 'VOV', str.tostring(_vov_ann, '#.##') + '%', not na(_vov_med) and _vov > _vov_med * 1.15 ? c_pressure : c_normal)
-    f_row(_T, 20, 'IV/RV', _use_vix and not na(_vix_raw) ? str.tostring(_iv_rv_factor, '#.##') + '×' : _use_vix ? '—' : 'N/A', _ivrc)
-    f_row(_T, 21, 'β d/w/m', str.tostring(_bd, '#.##') + ' / ' + str.tostring(_bw, '#.##') + ' / ' + str.tostring(_bm, '#.##'), c_normal)
-    f_row(_T, 22, 'OLS', _ols_active ? 'Active' : 'Warmup', _ols_col)
+        f_section(_T, 16, 'CALIBRATION')
+        f_row(_T, 17, 'Inner Cal', str.tostring(_cal_inner_up, '#.##') + ' / ' + str.tostring(_cal_inner_dn, '#.##'), _cal_col)
+        f_row(_T, 18, 'Outer Cal', str.tostring(_cal_up, '#.##') + ' / ' + str.tostring(_cal_dn, '#.##'), _cal_col)
+        f_row(_T, 19, 'Cal Sess', str.tostring(_cal_sessions_used) + ' / ' + str.tostring(i_cal_len), _cal_col)
+        f_row(_T, 20, 'Confidence', str.tostring(_model_confidence, '#'), _conf_col)
+        f_row(_T, 21, 'Hurst', str.tostring(_H, '#.###'), _hcol)
+        f_row(_T, 22, 'HAR Vol', str.tostring(_ann, '#.##') + '%', color.rgb(255, 191, 36))
+        f_row(_T, 23, 'OLS', _ols_active ? 'Active' : 'Warmup', _ols_col)
 
 // ================================================================
 // DIAGNOSTIC CSV LOGGING
 // ================================================================
 if i_log and barstate.isfirst
-    log.info('time_ms,symbol,preset,tf,strike_step,session_min,close,anchor,pred_hi,pred_lo,raw_up_half,raw_dn_half,cal_up,cal_dn,target_containment,cal_sessions,model_confidence,har_vol%,hurst_H,sem_up,sem_down,vov%,jump_vol%,jump_flag,beta_d,beta_w,beta_m,diurnal_bk,diurnal_df,base_move,remaining_up,remaining_dn,consumed_pct,cons_velocity,nearest_band_dist,breach_prob,regime,sess_hi,sess_lo,ridge_lambda,har_fallback_used,cal_alpha_effective,regime_dwell_bars')
+    log.info('time_ms,symbol,preset,inner_preset,tf,strike_step,session_min,close,anchor,pred_hi,pred_lo,inner_hi,inner_lo,raw_up_half,raw_dn_half,cal_up,cal_dn,cal_inner_up,cal_inner_dn,target_containment,inner_target,cal_sessions,model_confidence,har_vol%,hurst_H,sem_up,sem_down,vov%,jump_vol%,jump_flag,beta_d,beta_w,beta_m,diurnal_bk,diurnal_df,base_move,remaining_up,remaining_dn,consumed_pct,cons_velocity,nearest_inner_dist,breakout_score,dir_lean,entry_grade,mom_5,accel,buyer_regime,empirical_hit_rate,session_max_bk_score,sess_hi,sess_lo,ridge_lambda,har_fallback_used,cal_alpha_effective,regime_dwell_bars')
 
 if i_log and barstate.isconfirmed
     float _log_ann = math.sqrt(math.max(_hv, 0.0) * 252.0) * 100.0
     float _log_jann = math.sqrt(math.max(_jv, 0.0) * 252.0) * 100.0
-    float _log_vann = _vov * math.sqrt(252.0) * 100.0
     int _log_bk = _use_nse_diurnal ? f_bucket() : -1
     string _csv =
          str.tostring(time) + ',' +
          syminfo.ticker + ',' +
          str.tostring(_preset_sigma, '#.##') + ',' +
+         str.tostring(_preset_inner_sigma, '#.##') + ',' +
          timeframe.period + ',' +
          str.tostring(_strike_int) + ',' +
          str.tostring(i_sess) + ',' +
@@ -1076,18 +1227,23 @@ if i_log and barstate.isconfirmed
          str.tostring(_pred_anch, '#.##') + ',' +
          str.tostring(_pred_hi, '#.##') + ',' +
          str.tostring(_pred_lo, '#.##') + ',' +
+         str.tostring(_inner_hi, '#.##') + ',' +
+         str.tostring(_inner_lo, '#.##') + ',' +
          str.tostring(_raw_up_half, '#.##') + ',' +
          str.tostring(_raw_dn_half, '#.##') + ',' +
          str.tostring(_cal_up, '#.####') + ',' +
          str.tostring(_cal_dn, '#.####') + ',' +
+         str.tostring(_cal_inner_up, '#.####') + ',' +
+         str.tostring(_cal_inner_dn, '#.####') + ',' +
          str.tostring(i_target, '#.##') + ',' +
+         str.tostring(i_inner_target, '#.##') + ',' +
          str.tostring(_cal_sessions_used) + ',' +
          str.tostring(_model_confidence, '#') + ',' +
          str.tostring(_log_ann, '#.##') + ',' +
          str.tostring(_H, '#.####') + ',' +
          str.tostring(_us, '#.####') + ',' +
          str.tostring(_ls, '#.####') + ',' +
-         str.tostring(_log_vann, '#.##') + ',' +
+         str.tostring(_vov * math.sqrt(252.0) * 100.0, '#.##') + ',' +
          str.tostring(_log_jann, '#.##') + ',' +
          (_jfl > 0.5 ? '1' : '0') + ',' +
          str.tostring(_bd, '#.####') + ',' +
@@ -1100,9 +1256,15 @@ if i_log and barstate.isconfirmed
          str.tostring(_remaining_dn, '#.##') + ',' +
          str.tostring(_consumed_pct, '#.##') + ',' +
          str.tostring(_cons_velocity, '#.##') + ',' +
-         str.tostring(_nearest_dist, '#.####') + ',' +
-         str.tostring(_breach_prob, '#.##') + ',' +
+         str.tostring(_nearest_inner, '#.####') + ',' +
+         str.tostring(_breakout_score, '#.##') + ',' +
+         str.tostring(_dir_lean, '#.##') + ',' +
+         _entry_grade + ',' +
+         str.tostring(_mom_5, '#.##') + ',' +
+         str.tostring(_accel, '#.##') + ',' +
          _regime + ',' +
+         str.tostring(_empirical_hit_rate, '#.##') + ',' +
+         str.tostring(_session_max_bk_score, '#.##') + ',' +
          str.tostring(_sess_hi, '#.##') + ',' +
          str.tostring(_sess_lo, '#.##') + ',' +
          str.tostring(_ridge_lambda, '#.########') + ',' +

@@ -1,0 +1,467 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © majhikeshab5
+
+//@version=6
+indicator("CSDCE & Strike Profile", precision=3, overlay=true, max_boxes_count=500, max_labels_count=500, dynamic_requests=true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STRIKE PRICE DELTA PROFILE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Strike Profile Inputs ───────────────────────────────────────────────────
+string sdp_exp     = input.string("260415", "Options Expiry YYMMDD",
+  group="Strike Delta Profile",
+  tooltip="TradingView expiry in YYMMDD format. Check any option ticker for the date.")
+int    sdp_atm_in  = input.int(23800, "ATM Strike Price",
+  group="Strike Delta Profile",
+  tooltip="Set to the nearest round strike of current spot. Example: if NIFTY is 23775, enter 23800 (step=50) or 23800 (step=100).")
+int    sdp_offset  = input.int(20, "Profile Right Offset (bars)", minval=5, maxval=100,
+  group="Strike Delta Profile")
+int    sdp_width   = input.int(50, "Max Box Width (bars)", minval=10, maxval=200,
+  group="Strike Delta Profile")
+bool   sdp_show    = input.bool(true, "Show Strike Profile",
+  group="Strike Delta Profile")
+bool   sdp_show_diag = input.bool(true, "Show Meticulous Debug",
+  group="Strike Delta Profile", tooltip="Shows the exact asset mappings and request strings to help debug why symbols aren't returning data.")
+string sdp_reset_mode = input.string("Daily", "Percentage Text Reset",
+  options=["Daily", "Weekly", "Monthly"], group="Strike Delta Profile",
+  tooltip="Freezes each strike's cumulative baseline internally at the first bar of the period in order to output the correct session text change (e.g. +5.5%).")
+
+// ─── Asset Guard ─────────────────────────────────────────────────────────────
+bool sdp_active = (syminfo.type == "index" and (str.contains(syminfo.prefix, "NSE") or str.contains(syminfo.prefix, "BSE"))) or syminfo.prefix == "MCX" or (syminfo.prefix == "NSE" and syminfo.root == "MCX")
+
+// ─── Auto Step Detection ─────────────────────────────────────────────────────
+int sdp_step = 50 // Default for Nifty, Finnifty, etc.
+if str.contains(syminfo.root, "BANKNIFTY") or str.contains(syminfo.root, "SENSEX") or str.contains(syminfo.root, "BANKEX") or str.contains(syminfo.root, "NIFTYNXT50") or str.contains(syminfo.root, "NIFTYJR")
+    sdp_step := 100
+else if str.contains(syminfo.root, "MIDCPNIFTY") or str.contains(syminfo.root, "NIFTY_MID_SELECT")
+    sdp_step := 25
+else if syminfo.prefix == "NSE" and syminfo.root == "MCX"
+    sdp_step := 20 // The NSE:MCX stock options typically trade in steps of 20
+else if syminfo.prefix == "MCX"
+    if str.contains(syminfo.root, "SILVER")
+        sdp_step := 500
+    else if str.contains(syminfo.root, "CRUDEOIL") or str.contains(syminfo.root, "GOLD")
+        sdp_step := 100
+    else if str.contains(syminfo.root, "NATURALGAS")
+        sdp_step := 5
+
+// Auto-snap the user's ATM input to perfectly align with the step grid 
+// (e.g. if user types 77550 on Sensex, it snaps to 77600 to prevent NaN requests)
+int sdp_atm = int(math.round(sdp_atm_in / float(sdp_step)) * float(sdp_step))
+
+// ─── Cumulative Net Delta Engine ─────────────────────────────────────────────
+f_sdp_cum_delta() =>
+    float _tw       = math.max(high, close[1]) - math.max(open, close)
+    float _bw       = math.min(open, close)    - math.min(low, close[1])
+    float _body     = math.abs(open - close)
+    float _tw_sq    = _tw * _tw
+    float _bw_sq    = _bw * _bw
+    float _body_sq  = _body * _body
+    float _total_sq = _tw_sq + _bw_sq + _body_sq
+    bool  _bullish  = (_bw + (close - open) - _tw) >= 0
+    float _buy_sh   = _bw_sq + (_bullish     ? _body_sq : 0)
+    float _sell_sh  = _tw_sq + (not _bullish ? _body_sq : 0)
+    float _buy_pct  = _total_sq > 0 ? _buy_sh  / _total_sq : 0.5
+    float _sell_pct = _total_sq > 0 ? _sell_sh / _total_sq : 0.5
+    float _net_tick = nz(volume, 0) * (_bullish ? _buy_pct  : - _sell_pct)
+    ta.cum(_net_tick)
+
+// ─── Option Root & Prefix Mapping ────────────────────────────────────────────
+// Clean the prefix (removes _DLY or other feed tags)
+string sdp_opt_prefix = syminfo.prefix == "MCX" ? "MCX" : str.contains(syminfo.prefix, "BSE") ? "BSE" : "NSE"
+
+string sdp_opt_root = syminfo.root
+if syminfo.root == "SENSEX"
+    sdp_opt_root := "BSX"
+else if syminfo.root == "BANKEX"
+    sdp_opt_root := "BKX"
+else if str.contains(syminfo.root, "CNXFINANCE")
+    sdp_opt_root := "FINNIFTY"
+else if str.contains(syminfo.root, "NIFTY_MID_SELECT")
+    sdp_opt_root := "MIDCPNIFTY"
+else if str.contains(syminfo.root, "NIFTYJR")
+    sdp_opt_root := "NIFTYNXT50"
+
+f_sdp_tk(int strike, string opt_type) =>
+    sdp_opt_prefix + ":" + sdp_opt_root + sdp_exp + opt_type + str.tostring(strike)
+
+// ─── Security Calls: 19 Strikes × 2 Legs = 38 Requests ─────────────────────
+float sdp_ce_u9 = request.security(f_sdp_tk(sdp_atm + 9*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_u9 = request.security(f_sdp_tk(sdp_atm + 9*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_u8 = request.security(f_sdp_tk(sdp_atm + 8*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_u8 = request.security(f_sdp_tk(sdp_atm + 8*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_u7 = request.security(f_sdp_tk(sdp_atm + 7*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_u7 = request.security(f_sdp_tk(sdp_atm + 7*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_u6 = request.security(f_sdp_tk(sdp_atm + 6*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_u6 = request.security(f_sdp_tk(sdp_atm + 6*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_u5 = request.security(f_sdp_tk(sdp_atm + 5*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_u5 = request.security(f_sdp_tk(sdp_atm + 5*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_u4 = request.security(f_sdp_tk(sdp_atm + 4*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_u4 = request.security(f_sdp_tk(sdp_atm + 4*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_u3 = request.security(f_sdp_tk(sdp_atm + 3*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_u3 = request.security(f_sdp_tk(sdp_atm + 3*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_u2 = request.security(f_sdp_tk(sdp_atm + 2*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_u2 = request.security(f_sdp_tk(sdp_atm + 2*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_u1 = request.security(f_sdp_tk(sdp_atm + 1*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_u1 = request.security(f_sdp_tk(sdp_atm + 1*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_0  = request.security(f_sdp_tk(sdp_atm,              "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_0  = request.security(f_sdp_tk(sdp_atm,              "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_d1 = request.security(f_sdp_tk(sdp_atm - 1*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_d1 = request.security(f_sdp_tk(sdp_atm - 1*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_d2 = request.security(f_sdp_tk(sdp_atm - 2*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_d2 = request.security(f_sdp_tk(sdp_atm - 2*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_d3 = request.security(f_sdp_tk(sdp_atm - 3*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_d3 = request.security(f_sdp_tk(sdp_atm - 3*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_d4 = request.security(f_sdp_tk(sdp_atm - 4*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_d4 = request.security(f_sdp_tk(sdp_atm - 4*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_d5 = request.security(f_sdp_tk(sdp_atm - 5*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_d5 = request.security(f_sdp_tk(sdp_atm - 5*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_d6 = request.security(f_sdp_tk(sdp_atm - 6*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_d6 = request.security(f_sdp_tk(sdp_atm - 6*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_d7 = request.security(f_sdp_tk(sdp_atm - 7*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_d7 = request.security(f_sdp_tk(sdp_atm - 7*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_d8 = request.security(f_sdp_tk(sdp_atm - 8*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_d8 = request.security(f_sdp_tk(sdp_atm - 8*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_ce_d9 = request.security(f_sdp_tk(sdp_atm - 9*sdp_step, "C"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+float sdp_pe_d9 = request.security(f_sdp_tk(sdp_atm - 9*sdp_step, "P"), timeframe.period, f_sdp_cum_delta(), ignore_invalid_symbol=true)
+
+// ─── Helpers Formatting Labels ───────────────────────────────────────────────
+f_pct_str(float current_val, float base_val) =>
+    float pct = na
+    if not na(current_val) and not na(base_val) and math.abs(base_val) > 0.000001
+        pct := (current_val - base_val) * 100.0 / math.abs(base_val)
+    na(pct) ? "--" : pct > 0 ? "+" + str.tostring(pct, "#.0") + "%" : str.tostring(pct, "#.0") + "%"
+
+f_pct_col(float current_val, float base_val) =>
+    float pct = na
+    if not na(current_val) and not na(base_val) and math.abs(base_val) > 0.000001
+        pct := (current_val - base_val) * 100.0 / math.abs(base_val)
+    na(pct) ? color.silver : pct > 0 ? color.rgb(0, 255, 0) : pct < 0 ? color.rgb(255, 0, 40) : color.white
+
+// ─── Drawing Engine Arrays ───────────────────────────────────────────────────
+var box[]   sdp_boxes     = array.new<box>()
+var label[] pct_labels    = array.new<label>()
+var label   sdp_debug_lbl = na
+
+// Arrays dedicated to locking the baseline ONLY for the percentage text math
+var float[] sdp_base_values = array.new_float(19, na)
+
+// ─── Snapshot Baseline Logic ─────────────────────────────────────────────────
+bool sdp_session_open = ta.change(time("D")) != 0
+bool sdp_new_week = ta.change(time("W")) != 0
+bool sdp_new_month = ta.change(time("M")) != 0
+
+bool sdp_reset_bar = sdp_session_open
+if sdp_reset_mode == "Weekly"
+    sdp_reset_bar := sdp_session_open and sdp_new_week
+else if sdp_reset_mode == "Monthly"
+    sdp_reset_bar := sdp_session_open and sdp_new_month
+
+// Target the explicit closing value of the previous day [1] when a new session begins
+if sdp_reset_bar
+    array.set(sdp_base_values, 0,  na(sdp_ce_u9[1]) ? na : nz(sdp_ce_u9[1]) - nz(sdp_pe_u9[1]))
+    array.set(sdp_base_values, 1,  na(sdp_ce_u8[1]) ? na : nz(sdp_ce_u8[1]) - nz(sdp_pe_u8[1]))
+    array.set(sdp_base_values, 2,  na(sdp_ce_u7[1]) ? na : nz(sdp_ce_u7[1]) - nz(sdp_pe_u7[1]))
+    array.set(sdp_base_values, 3,  na(sdp_ce_u6[1]) ? na : nz(sdp_ce_u6[1]) - nz(sdp_pe_u6[1]))
+    array.set(sdp_base_values, 4,  na(sdp_ce_u5[1]) ? na : nz(sdp_ce_u5[1]) - nz(sdp_pe_u5[1]))
+    array.set(sdp_base_values, 5,  na(sdp_ce_u4[1]) ? na : nz(sdp_ce_u4[1]) - nz(sdp_pe_u4[1]))
+    array.set(sdp_base_values, 6,  na(sdp_ce_u3[1]) ? na : nz(sdp_ce_u3[1]) - nz(sdp_pe_u3[1]))
+    array.set(sdp_base_values, 7,  na(sdp_ce_u2[1]) ? na : nz(sdp_ce_u2[1]) - nz(sdp_pe_u2[1]))
+    array.set(sdp_base_values, 8,  na(sdp_ce_u1[1]) ? na : nz(sdp_ce_u1[1]) - nz(sdp_pe_u1[1]))
+    array.set(sdp_base_values, 9,  na(sdp_ce_0[1])  ? na : nz(sdp_ce_0[1])  - nz(sdp_pe_0[1]))
+    array.set(sdp_base_values, 10, na(sdp_ce_d1[1]) ? na : nz(sdp_ce_d1[1]) - nz(sdp_pe_d1[1]))
+    array.set(sdp_base_values, 11, na(sdp_ce_d2[1]) ? na : nz(sdp_ce_d2[1]) - nz(sdp_pe_d2[1]))
+    array.set(sdp_base_values, 12, na(sdp_ce_d3[1]) ? na : nz(sdp_ce_d3[1]) - nz(sdp_pe_d3[1]))
+    array.set(sdp_base_values, 13, na(sdp_ce_d4[1]) ? na : nz(sdp_ce_d4[1]) - nz(sdp_pe_d4[1]))
+    array.set(sdp_base_values, 14, na(sdp_ce_d5[1]) ? na : nz(sdp_ce_d5[1]) - nz(sdp_pe_d5[1]))
+    array.set(sdp_base_values, 15, na(sdp_ce_d6[1]) ? na : nz(sdp_ce_d6[1]) - nz(sdp_pe_d6[1]))
+    array.set(sdp_base_values, 16, na(sdp_ce_d7[1]) ? na : nz(sdp_ce_d7[1]) - nz(sdp_pe_d7[1]))
+    array.set(sdp_base_values, 17, na(sdp_ce_d8[1]) ? na : nz(sdp_ce_d8[1]) - nz(sdp_pe_d8[1]))
+    array.set(sdp_base_values, 18, na(sdp_ce_d9[1]) ? na : nz(sdp_ce_d9[1]) - nz(sdp_pe_d9[1]))
+
+// ─── SOTA MATH UTILS ─────────────────────────────────────────────────────────
+f_spearman(float src1, float src2, int length) =>
+    float[] arr1 = array.new_float(length)
+    float[] arr2 = array.new_float(length)
+    for i = 0 to length - 1
+        array.set(arr1, i, nz(src1[i]))
+        array.set(arr2, i, nz(src2[i]))
+    
+    float[] sorted1 = array.copy(arr1)
+    float[] sorted2 = array.copy(arr2)
+    array.sort(sorted1)
+    array.sort(sorted2)
+    
+    float sum_d2 = 0.0
+    for i = 0 to length - 1
+        float val1 = array.get(arr1, i)
+        float val2 = array.get(arr2, i)
+        
+        int first1 = array.indexof(sorted1, val1)
+        int last1  = array.lastindexof(sorted1, val1)
+        float rank1 = (first1 + last1) / 2.0 + 1.0
+
+        int first2 = array.indexof(sorted2, val2)
+        int last2  = array.lastindexof(sorted2, val2)
+        float rank2 = (first2 + last2) / 2.0 + 1.0
+        
+        float d = rank1 - rank2
+        sum_d2 += d * d
+        
+    float spearman = 1.0 - (6.0 * sum_d2) / (length * (math.pow(length, 2) - 1))
+    math.max(-1.0, math.min(1.0, spearman))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CROSS-STRIKE DELTA COHERENCE ENGINE (CSDCE)
+// ═══════════════════════════════════════════════════════════════════════════
+var box[] csdce_boxes = array.new<box>()
+var table csdce_table = table.new(position.bottom_right, 3, 3, bgcolor=color.new(color.black, 80), border_width=1, border_color=color.new(color.gray, 80))
+
+float lambda = input.float(0.3, title='Proximity Decay λ', minval=0.1, maxval=0.5, group='Coherence Engine')
+
+float[] arr_ce = array.from(sdp_ce_u9, sdp_ce_u8, sdp_ce_u7, sdp_ce_u6, sdp_ce_u5, sdp_ce_u4, sdp_ce_u3, sdp_ce_u2, sdp_ce_u1, sdp_ce_0, sdp_ce_d1, sdp_ce_d2, sdp_ce_d3, sdp_ce_d4, sdp_ce_d5, sdp_ce_d6, sdp_ce_d7, sdp_ce_d8, sdp_ce_d9)
+float[] arr_pe = array.from(sdp_pe_u9, sdp_pe_u8, sdp_pe_u7, sdp_pe_u6, sdp_pe_u5, sdp_pe_u4, sdp_pe_u3, sdp_pe_u2, sdp_pe_u1, sdp_pe_0, sdp_pe_d1, sdp_pe_d2, sdp_pe_d3, sdp_pe_d4, sdp_pe_d5, sdp_pe_d6, sdp_pe_d7, sdp_pe_d8, sdp_pe_d9)
+float[] arr_ce_prev = array.from(sdp_ce_u9[1], sdp_ce_u8[1], sdp_ce_u7[1], sdp_ce_u6[1], sdp_ce_u5[1], sdp_ce_u4[1], sdp_ce_u3[1], sdp_ce_u2[1], sdp_ce_u1[1], sdp_ce_0[1], sdp_ce_d1[1], sdp_ce_d2[1], sdp_ce_d3[1], sdp_ce_d4[1], sdp_ce_d5[1], sdp_ce_d6[1], sdp_ce_d7[1], sdp_ce_d8[1], sdp_ce_d9[1])
+float[] arr_pe_prev = array.from(sdp_pe_u9[1], sdp_pe_u8[1], sdp_pe_u7[1], sdp_pe_u6[1], sdp_pe_u5[1], sdp_pe_u4[1], sdp_pe_u3[1], sdp_pe_u2[1], sdp_pe_u1[1], sdp_pe_0[1], sdp_pe_d1[1], sdp_pe_d2[1], sdp_pe_d3[1], sdp_pe_d4[1], sdp_pe_d5[1], sdp_pe_d6[1], sdp_pe_d7[1], sdp_pe_d8[1], sdp_pe_d9[1])
+
+var float[] csdce_ce_base = array.new_float(19, na)
+var float[] csdce_pe_base = array.new_float(19, na)
+
+if sdp_reset_bar
+    for i = 0 to 18
+        array.set(csdce_ce_base, i, nz(array.get(arr_ce_prev, i)))
+        array.set(csdce_pe_base, i, nz(array.get(arr_pe_prev, i)))
+
+float sum_w_sign_num = 0.0
+float sum_w_sign_den = 0.0
+float sum_w_flow_num = 0.0
+float sum_w_flow_den = 0.0
+float total_w = 0.0
+
+for i = 0 to 18
+    float ce_curr = array.get(arr_ce, i)
+    float pe_curr = array.get(arr_pe, i)
+    float ce_base = array.get(csdce_ce_base, i)
+    float pe_base = array.get(csdce_pe_base, i)
+    
+    float w_i = math.exp(-lambda * math.abs(i - 9))
+    
+    if na(ce_curr) or na(pe_curr) or na(ce_base) or na(pe_base)
+        w_i := 0.0
+    else
+        float dCE = ce_curr - ce_base
+        float dPE = pe_curr - pe_base
+        
+        float abs_ce = math.abs(dCE)
+        float abs_pe = math.abs(dPE)
+        float SAR_i = (2.0 * math.min(abs_ce, abs_pe)) / (abs_ce + abs_pe + 0.0001)
+        
+        if SAR_i > 0.7
+            w_i := 0.0
+            
+        if w_i > 0.0
+            total_w += w_i
+            float v_i = dCE - dPE
+            
+            if v_i != 0.0
+                sum_w_sign_num += w_i * math.sign(v_i)
+                sum_w_sign_den += w_i
+                
+            sum_w_flow_num += w_i * v_i
+            sum_w_flow_den += w_i * math.abs(v_i)
+
+float C_sign = sum_w_sign_den > 0.0 ? sum_w_sign_num / sum_w_sign_den : 0.0
+float C_flow = sum_w_flow_den > 0.0 ? sum_w_flow_num / (sum_w_flow_den + 0.0001) : 0.0
+float C = (C_sign + C_flow) / 2.0
+float P = sum_w_flow_den > 0.0 ? math.abs(sum_w_flow_num) / (sum_w_flow_den + 0.0001) : 0.0
+float raw_conv = C * P * 100.0
+
+var float conv_p = 0.1
+var float conv_k = na
+
+float Q_conv = 0.01
+float R_conv = 0.3
+float p_pred = conv_p + Q_conv
+float gain_conv = p_pred / (p_pred + R_conv)
+conv_p := (1.0 - gain_conv) * p_pred
+float prev_conv = na(conv_k) ? (na(raw_conv) ? 0.0 : raw_conv) : conv_k
+conv_k := prev_conv + gain_conv * ((na(raw_conv) ? 0.0 : raw_conv) - prev_conv)
+
+float Conviction_K = total_w >= 2.0 ? conv_k : 0.0
+
+// ─── SOTA Divergence: Spearman Rank Correlation ──────────────────────────────
+float Divergence = total_w >= 2.0 ? f_spearman(close, Conviction_K, 15) : 0.0
+
+// ─── SOTA Acceleration: Modified Z-Score (MAD) ───────────────────────────────
+float dFlow = Conviction_K - nz(Conviction_K[1])
+int mad_len = 20
+float flow_med = ta.median(dFlow, mad_len)
+float[] devs = array.new_float(mad_len, 0.0)
+for i = 0 to mad_len - 1
+    array.set(devs, i, math.abs(nz(dFlow[i]) - flow_med))
+float flow_mad = array.median(devs)
+float safe_mad = math.max(flow_mad, 0.0001)
+float Acceleration = total_w >= 2.0 ? 0.6745 * (dFlow - flow_med) / safe_mad : 0.0
+
+if barstate.islast and sdp_show and sdp_active
+    // Gather all current net values identically to the user's working code
+    float[] sdp_net = array.from(
+      nz(sdp_ce_u9) - nz(sdp_pe_u9),
+      nz(sdp_ce_u8) - nz(sdp_pe_u8),
+      nz(sdp_ce_u7) - nz(sdp_pe_u7),
+      nz(sdp_ce_u6) - nz(sdp_pe_u6),
+      nz(sdp_ce_u5) - nz(sdp_pe_u5),
+      nz(sdp_ce_u4) - nz(sdp_pe_u4),
+      nz(sdp_ce_u3) - nz(sdp_pe_u3),
+      nz(sdp_ce_u2) - nz(sdp_pe_u2),
+      nz(sdp_ce_u1) - nz(sdp_pe_u1),
+      nz(sdp_ce_0)  - nz(sdp_pe_0),
+      nz(sdp_ce_d1) - nz(sdp_pe_d1),
+      nz(sdp_ce_d2) - nz(sdp_pe_d2),
+      nz(sdp_ce_d3) - nz(sdp_pe_d3),
+      nz(sdp_ce_d4) - nz(sdp_pe_d4),
+      nz(sdp_ce_d5) - nz(sdp_pe_d5),
+      nz(sdp_ce_d6) - nz(sdp_pe_d6),
+      nz(sdp_ce_d7) - nz(sdp_pe_d7),
+      nz(sdp_ce_d8) - nz(sdp_pe_d8),
+      nz(sdp_ce_d9) - nz(sdp_pe_d9)
+     )
+
+    // Purge previous frame drawings
+    if array.size(sdp_boxes) > 0
+        for i = 0 to array.size(sdp_boxes) - 1
+            box.delete(array.get(sdp_boxes, i))
+        array.clear(sdp_boxes)
+
+    if array.size(pct_labels) > 0
+        for i = 0 to array.size(pct_labels) - 1
+            label.delete(array.get(pct_labels, i))
+        array.clear(pct_labels)
+
+    // Compute normalization values (USER'S ORIGINAL METRIC)
+    float total_abs = 0.0
+    float sdp_max   = 0.0
+    for i = 0 to 18
+        float abs_val = math.abs(array.get(sdp_net, i))
+        total_abs    += abs_val
+        sdp_max      := math.max(sdp_max, abs_val)
+
+    float min_net = array.min(sdp_net)
+    float max_net = array.max(sdp_net)
+
+    // Render 19 profile boxes
+    int   sdp_x1 = bar_index + sdp_offset
+    float step_f = float(sdp_step)
+
+    for i = 0 to 18
+        float val        = array.get(sdp_net, i)
+        float base_val   = array.get(sdp_base_values, i)
+        float strike_lvl = float(sdp_atm + ((9 - i) * sdp_step))
+
+        // WIDTH: normalized by max absolute delta (longest bar = 100%)
+        float width_pct = sdp_max > 0 ? (math.abs(val) / sdp_max) : 0.0
+        int   sdp_x2    = sdp_x1 + math.max(2, math.round(sdp_width * width_pct))
+
+        color clr = color.from_gradient(val, min_net, max_net, color.rgb(255, 0, 0), color.rgb(0, 255, 0))
+
+        color bg  = color.new(clr, 0)
+        color brd = clr
+
+        // Box: 60% height fill, 40% gap between stacked boxes
+        int strike_int = sdp_atm + ((9 - i) * sdp_step)
+        box bx = box.new(sdp_x1, strike_lvl + (step_f * 0.30),
+                         sdp_x2, strike_lvl - (step_f * 0.30),
+                         bgcolor=bg, border_color=brd,
+                         text=str.tostring(strike_int), text_color=color.rgb(0,96,255),
+                         text_size=size.small, text_halign=text.align_center,
+                         text_valign=text.align_center,
+                         xloc=xloc.bar_index, force_overlay=true)
+        array.push(sdp_boxes, bx)
+        
+        // PCT CHANGE LABEL
+        label pct_lbl = label.new(sdp_x2 + 1, strike_lvl, f_pct_str(val, base_val),
+            xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left,
+            color=color.new(color.black, 100), textcolor=f_pct_col(val, base_val),
+            size=size.large, force_overlay=true)
+        array.push(pct_labels, pct_lbl)
+
+    // CSDCE Visual Rendering
+    if array.size(csdce_boxes) > 0
+        for i = 0 to array.size(csdce_boxes) - 1
+            box.delete(array.get(csdce_boxes, i))
+        array.clear(csdce_boxes)
+
+    int csdce_x1 = bar_index + sdp_offset + sdp_width + 5
+    int csdce_x2 = csdce_x1 + 4
+    
+    float atr_10 = nz(ta.atr(10))
+    float max_height = atr_10 * 3.0
+    float conv_height = max_height * (math.min(math.abs(Conviction_K), 100.0) / 100.0)
+    
+    float box_top = Conviction_K > 0 ? close + conv_height : close
+    float box_bot = Conviction_K < 0 ? close - conv_height : close
+    
+    color box_color = Conviction_K > 0 ? color.new(color.green, 0) : color.new(color.red, 0)
+    string box_border = Divergence < -0.7 ? line.style_dashed : line.style_solid
+    
+    box csdce_box = box.new(csdce_x1, box_top, csdce_x2, box_bot, border_color=box_color, border_style=box_border, bgcolor=color.new(box_color, 50), xloc=xloc.bar_index, force_overlay=true)
+    array.push(csdce_boxes, csdce_box)
+    
+    string line_1_txt = Conviction_K > 60 ? 'STRONG BULL' : Conviction_K > 30 ? 'MOD BULL' : Conviction_K < -60 ? 'STRONG BEAR' : Conviction_K < -30 ? 'MOD BEAR' : 'NO EDGE'
+    string line_2_txt = Divergence < -0.7 ? '🚨 STRUCTURAL DIV' : Divergence > 0.7 ? '✅ ALIGNED' : '⏸ MIXED'
+    string line_3_txt = Acceleration > 2.0 ? '⚡ 2σ SPIKE' : Acceleration < -2.0 ? '🔻 2σ DUMP' : Acceleration > 1.0 ? '↗ BUILDING' : Acceleration < -1.0 ? '↘ UNWIND' : '⏸ NEUTRAL'
+    
+    color c_conv = Conviction_K > 30 ? color.green : Conviction_K < -30 ? color.red : color.gray
+    color c_div  = Divergence < -0.7 ? color.yellow : Divergence > 0.7 ? color.white : color.gray
+    color c_acc  = math.abs(Acceleration) > 2.0 ? color.fuchsia : Acceleration > 1.0 ? color.lime : Acceleration < -1.0 ? color.orange : color.gray
+    
+    table.cell(csdce_table, 0, 0, "Conviction", text_color=color.silver, text_size=size.normal, text_halign=text.align_left)
+    table.cell(csdce_table, 1, 0, str.tostring(Conviction_K, "#.0"), text_color=color.white, text_size=size.normal)
+    table.cell(csdce_table, 2, 0, line_1_txt, text_color=c_conv, text_size=size.normal, text_halign=text.align_left)
+    
+    table.cell(csdce_table, 0, 1, "Divergence", text_color=color.silver, text_size=size.normal, text_halign=text.align_left)
+    table.cell(csdce_table, 1, 1, str.tostring(Divergence, "#.##"), text_color=color.white, text_size=size.normal)
+    table.cell(csdce_table, 2, 1, line_2_txt, text_color=c_div, text_size=size.normal, text_halign=text.align_left)
+    
+    table.cell(csdce_table, 0, 2, "Acceleration", text_color=color.silver, text_size=size.normal, text_halign=text.align_left)
+    table.cell(csdce_table, 1, 2, str.tostring(Acceleration, "#.0"), text_color=color.white, text_size=size.normal)
+    table.cell(csdce_table, 2, 2, line_3_txt, text_color=c_acc, text_size=size.normal, text_halign=text.align_left)
+
+if barstate.islast
+    // ─── Meticulous Debug Panel ──────────────────────────────────────────────
+    if sdp_show_diag
+        string t_atm_c = f_sdp_tk(sdp_atm, "C")
+        string t_atm_p = f_sdp_tk(sdp_atm, "P")
+        
+        string dbg = "━━━ SDP ALIGNMENT DIAGNOSTIC ━━━\n"
+        dbg += "Chart Entity: [" + syminfo.prefix + ":" + syminfo.root + "]\n"
+        dbg += "Derived Root: " + sdp_opt_root + "\n"
+        dbg += "Input Expiry: " + sdp_exp + "\n"
+        dbg += "Step Trigger: " + str.tostring(sdp_step) + "\n"
+        dbg += "Input ATM:    " + str.tostring(sdp_atm) + "\n\n"
+        dbg += "Gen CE String: " + t_atm_c + "\n"
+        dbg += "Gen PE String: " + t_atm_p + "\n\n"
+        dbg += "Live CE Value: " + str.tostring(sdp_ce_0) + "\n"
+        dbg += "Live PE Value: " + str.tostring(sdp_pe_0) + "\n"
+        
+        if not sdp_active
+            dbg += "\n[!] ASSET GUARD BLOCKED: Asset not supported.\n"
+            dbg += "Your current chart prefix is: '" + syminfo.prefix + "'.\n"
+            dbg += "This script supports NSE/BSE indices, MCX commodities, and NSE:MCX stock."
+        else if na(sdp_ce_0) and na(sdp_pe_0)
+            dbg += "\n[!] CRITICAL FAILURE: TradingView returned NaN (No Data).\n"
+            dbg += "The string (" + t_atm_c + ") is being rejected by the exchange.\n"
+            dbg += "Check manually if this exact ticker exists."
+            
+        if na(sdp_debug_lbl)
+            sdp_debug_lbl := label.new(bar_index + sdp_offset + 10, close, dbg,
+              xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left,
+              color=color.new(color.black, 20), textcolor=color.rgb(0,0,0), size=size.large,
+              force_overlay=true, text_font_family=font.family_monospace)
+        else
+            label.set_xy(sdp_debug_lbl, bar_index + sdp_offset + 10, close)
+            label.set_text(sdp_debug_lbl, dbg)
+    else if not na(sdp_debug_lbl)
+        label.delete(sdp_debug_lbl)
+        sdp_debug_lbl := na

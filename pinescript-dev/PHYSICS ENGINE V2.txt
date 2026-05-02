@@ -1,0 +1,159 @@
+// ==============================================================================
+// SINGLE-SCORE INDEX ↔ CE/PE COMPARATOR FEATURE — FINAL PRODUCTION
+// ==============================================================================
+// Output: ComparatorScore ∈ [-1, +1]
+//   +1 → Strong CE dominance (bullish institutional reaction)
+//   -1 → Strong PE dominance (bearish institutional reaction)
+//    0 → No dominance / noise / volatility regime
+//
+// Architecture:
+//   1. Each option's CUMULATIVE log return is fed to the physics engine (LEVEL input).
+//   2. CE and PE are scored independently — no delta=1 assumption.
+//   3. Dominance = CE_score - PE_score inherently captures index response.
+//   4. Index structural score provides regime confidence (not excess return).
+//   5. Weight = absolute price change / index ATR (no penny-option bias).
+//   6. Three continuous regime filters: vol expansion, noise, concentration.
+// ==============================================================================
+
+// ─── NORMALIZATION ──────────────────────────────────────────────────────────────
+// Cumulative log return: a LEVEL series that the physics engine can differentiate.
+// d1 of this = velocity (log return), d2 = acceleration, d3 = jerk, d4 = snap.
+f_cum_log_ret(float src) =>
+    float lr = src > 0 and nz(src[1]) > 0 ? math.log(src / nz(src[1])) : 0.0
+    ta.cum(lr)
+
+// ─── PHYSICS ENGINE ─────────────────────────────────────────────────────────────
+// 31-point merit-based derivative chain on a LEVEL series.
+// Returns: [Score ∈ [-1, +1], velocity (d1)]
+f_structural_score(float p) =>
+    if bar_index < 10
+        [0.0, 0.0]
+    else
+        float score = 0.0
+        float _eps  = 1e-6
+        float _dz   = 1e-8
+
+        d1     = p - p[1]
+        d2     = p - 2*p[1] + p[2]
+        d3     = p - 3*p[1] + 3*p[2] - p[3]
+        d4     = p - 4*p[1] + 6*p[2] - 4*p[3] + p[4]
+
+        d2_e   = p - 2*p[2] + p[4]
+        d2_o   = p[1] - 2*p[3] + p[5]
+        d3_e   = p - 3*p[2] + 3*p[4] - p[6]
+        d3_o   = p[1] - 3*p[3] + 3*p[5] - p[7]
+
+        d1_x   = p - p[1] - p[2] + p[3]
+        d2_x   = p - p[1] - 2*p[2] + 2*p[3] + p[4] - p[5]
+        convex = 2*p - p[1] - p[2]
+
+        E2_1 = d2 / math.max(math.abs(d1), _eps)
+        E4_3 = d4 / math.max(math.abs(d3), _eps)
+
+        score += math.abs(d1)     < _dz ? 0.0 : d1     >= 0 ? 1.0 : -1.0
+        score += math.abs(d1_x)   < _dz ? 0.0 : d1_x   >= 0 ? 1.0 : -1.0
+        score += math.abs(d2)     < _dz ? 0.0 : d2     >= 0 ? 2.0 : -2.0
+        score += math.abs(d2_e)   < _dz ? 0.0 : d2_e   >= 0 ? 2.0 : -2.0
+        score += math.abs(d2_o)   < _dz ? 0.0 : d2_o   >= 0 ? 2.0 : -2.0
+        score += math.abs(d2_x)   < _dz ? 0.0 : d2_x   >= 0 ? 2.0 : -2.0
+        score += math.abs(convex) < _dz ? 0.0 : convex >= 0 ? 2.0 : -2.0
+        score += math.abs(d3)     < _dz ? 0.0 : d3     >= 0 ? 3.0 : -3.0
+        score += math.abs(d3_e)   < _dz ? 0.0 : d3_e   >= 0 ? 3.0 : -3.0
+        score += math.abs(d3_o)   < _dz ? 0.0 : d3_o   >= 0 ? 3.0 : -3.0
+        score += math.abs(d4)     < _dz ? 0.0 : d4     >= 0 ? 4.0 : -4.0
+
+        score += E2_1 >= nz(E2_1[1]) ? 1.0 : -1.0
+        score += E4_3 >= nz(E4_3[1]) ? 1.0 : -1.0
+
+        score += (d1 > _dz and d2 > _dz and d3 > _dz) ? 1.0 : -1.0
+        score += (d1 < -_dz and d2 < -_dz and d3 < -_dz) ? -1.0 : 1.0
+
+        score += (d1 > _dz and d2 > _dz and math.abs(d1) > math.abs(nz(d1[1]))) ? 1.0 : -1.0
+        score += (d1 < -_dz and d2 < -_dz and math.abs(d1) > math.abs(nz(d1[1]))) ? -1.0 : 1.0
+
+        [score / 31.0, d1]
+
+
+// ─── PER-STRIKE EVALUATION ──────────────────────────────────────────────────────
+// Scores CE and PE independently on their own cumulative log returns.
+// No excess return subtraction. No delta assumption.
+// Dominance = CE_score - PE_score inherently captures index response.
+//
+// Returns: [dominance, weight, ce_velocity, pe_velocity]
+f_eval_strike(float ce_price, float pe_price, float idx_atr) =>
+    ce_cum = f_cum_log_ret(ce_price)
+    pe_cum = f_cum_log_ret(pe_price)
+
+    [ce_score, ce_vel] = f_structural_score(ce_cum)
+    [pe_score, pe_vel] = f_structural_score(pe_cum)
+
+    float dominance = ce_score - pe_score
+
+    // Weight: absolute price change / index ATR
+    float ce_chg = math.abs(nz(ce_price) - nz(ce_price[1]))
+    float pe_chg = math.abs(nz(pe_price) - nz(pe_price[1]))
+    float weight = (ce_chg + pe_chg) / math.max(idx_atr, 1e-6)
+
+    [dominance, weight, ce_vel, pe_vel]
+
+
+// ─── AGGREGATOR + REGIME FILTER ─────────────────────────────────────────────────
+// idx_price: index price series for structural regime confidence.
+// idx_atr  : index ATR for noise floor calibration.
+f_comparator_feature(array<float> arr_dom, array<float> arr_wt, array<float> arr_ce_vel, array<float> arr_pe_vel, float idx_price, float idx_atr) =>
+    float sum_dw    = 0.0
+    float sum_w     = 0.0
+    int   n_vol_exp = 0
+
+    int size = array.size(arr_dom)
+    if size > 0
+        for i = 0 to size - 1
+            d  = array.get(arr_dom, i)
+            w  = array.get(arr_wt,  i)
+            cv = array.get(arr_ce_vel, i)
+            pv = array.get(arr_pe_vel, i)
+
+            sum_dw += d * w
+            sum_w  += w
+
+            // Vol expansion: both CE and PE velocities positive (prices co-rising)
+            // Threshold 1e-5 = 0.001% move, filters bid-ask microstructure noise
+            if cv > 1e-5 and pv > 1e-5
+                n_vol_exp += 1
+
+    // Weighted average dominance, clamped to [-1, +1]
+    float raw     = sum_w > 0 ? sum_dw / sum_w : 0.0
+    float clamped = math.max(-1.0, math.min(1.0, raw / 2.0))
+
+    // === INDEX STRUCTURAL CONFIDENCE ===
+    // If the index itself is not moving structurally, option signals are less trustworthy.
+    idx_cum = f_cum_log_ret(idx_price)
+    [idx_score, _idx_vel] = f_structural_score(idx_cum)
+    float idx_activity = math.abs(idx_score)
+    // Ramp: idx_activity 0→0.5 maps to confidence 0→1 (capped at 1)
+    float idx_confidence = math.min(1.0, idx_activity / 0.5)
+
+    // === REGIME FILTERS ===
+
+    // 1. Vol Expansion (sigmoid)
+    float vol_frac    = size > 0 ? float(n_vol_exp) / float(size) : 0.0
+    float vol_penalty = 1.0 / (1.0 + math.exp(10.0 * (vol_frac - 0.2)))
+
+    // 2. Noise Floor (linear ramp based on index ATR)
+    float noise_floor   = 0.005 * size
+    float noise_penalty = math.min(1.0, sum_w / math.max(noise_floor, 1e-6))
+
+    // 3. Concentration (Herfindahl-Hirschman Index)
+    float hhi = 0.0
+    if size > 0 and sum_w > 0
+        for i = 0 to size - 1
+            float share = array.get(arr_wt, i) / sum_w
+            hhi += share * share
+    float hhi_uniform  = size > 0 ? 1.0 / float(size) : 1.0
+    float conc_ratio   = (hhi - hhi_uniform) / math.max(1.0 - hhi_uniform, 1e-6)
+    float conc_penalty = math.max(0.1, math.min(1.0, conc_ratio * 1.0))
+
+    // Combined penalty
+    float penalty = vol_penalty * noise_penalty * conc_penalty * idx_confidence
+
+    clamped * penalty

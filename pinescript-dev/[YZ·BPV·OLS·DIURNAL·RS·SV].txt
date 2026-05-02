@@ -233,10 +233,10 @@ f_har(float rv_d, float rv_w, float rv_m, simple int on) =>
 f_row(table tbl, int r, string lbl, string val, color vc) =>
     table.cell(tbl, 0, r, lbl,
          text_color=color.rgb(140, 145, 165), text_size=size.small,
-         bgcolor=color.rgb(14, 14, 22, 5), text_halign=text.align_left)
+         bgcolor=na, text_halign=text.align_left)
     table.cell(tbl, 1, r, val,
          text_color=vc, text_size=size.small,
-         bgcolor=color.rgb(20, 20, 30, 5), text_halign=text.align_right)
+         bgcolor=na, text_halign=text.align_right)
 
 // ================================================================
 // DAILY BUNDLE — evaluated entirely in D context
@@ -443,116 +443,90 @@ float _olo   = _blo  - _vdel
 float _vov_pct = _vov * math.sqrt(252.0) * 100.0
 float _vov_n   = math.max(0.0, math.min(_vov_pct / 25.0, 1.0))
 
-// ── Dynamic Regime-Adaptive Palette ──────────────────────────────
-// color.from_gradient(value, bottom, top, bottom_color, top_color)
-// Pine v6: only 5 positional args, alpha embedded in color.rgb(r,g,b,a)
-color c_hi_bot = color.rgb(220, 80, 110)
-color c_hi_top = color.rgb(255, 0, 68)
-color c_hi_raw = color.from_gradient(_vov_n, 0.0, 1.0, c_hi_bot, c_hi_top)
+// ── Institutional Core Palette ───────────────────────────────────
+color c_res_core  = color.rgb(255, 30, 80)    // Razor Red
+color c_res_warn  = color.rgb(255, 80, 120)   // Warning Pink
+color c_sup_core  = color.rgb(0, 220, 160)    // Surgical Cyan
+color c_sup_warn  = color.rgb(0, 180, 130)    // Deep Teal
+color c_anch_base = color.rgb(255, 170, 0)    // Amber
+color c_anch_bull = color.rgb(0, 255, 200)    // Bull Skew
+color c_anch_bear = color.rgb(255, 0, 100)    // Bear Skew
 
-color c_lo_bot = color.rgb(0, 185, 140)
-color c_lo_top = color.rgb(0, 255, 170)
-color c_lo_raw = color.from_gradient(_vov_n, 0.0, 1.0, c_lo_bot, c_lo_top)
+// ── Inverse Alpha Architecture ───────────────────────────────────
+// High VoV = Highly visible outer risk zones (Alpha 70)
+// Low VoV = Near invisible outer risk zones (Alpha 95)
+int _alpha_vov = math.round(95.0 - (25.0 * _vov_n))
+color c_hi_vov = color.new(c_res_warn, _alpha_vov)
+color c_lo_vov = color.new(c_sup_warn, _alpha_vov)
 
-// Apply regime-dependent transparency: calm = 30% transparent, volatile = fully opaque
-int _vov_alpha = math.round(30.0 * (1.0 - _vov_n))
-color c_hi   = color.new(c_hi_raw, _vov_alpha)
-color c_lo   = color.new(c_lo_raw, _vov_alpha)
-color c_anch = color.rgb(255, 191, 36)
+// ── Dynamic Skew-Aware Anchor ────────────────────────────────────
+float _skew_ratio = _us / math.max(_ls, 0.0001)
+color c_anchor = _skew_ratio > 1.1 ? color.new(c_anch_bull, 20) :
+                 _skew_ratio < 0.9 ? color.new(c_anch_bear, 20) :
+                 color.new(c_anch_base, 20)
 
-// ── Multi-Layer Gradient Fills ───────────────────────────────────
-// Phantom midpoint plots between inner/outer bands create a
-// two-step transparency gradient simulating depth.
-float _grd_hi = (_bhi + _ohi) * 0.5
-float _grd_lo = (_blo + _olo) * 0.5
+// ── Band Lines & Fills (Artifact-Free) ───────────────────────────
+p_ohi = plot(i_vov ? _ohi : na, 'VoV High', color.new(c_res_warn, _alpha_vov), 1, plot.style_linebr)
+p_bhi = plot(_bhi,              '1σ High',  color.new(c_res_core, 0),          2)
+p_blo = plot(_blo,              '1σ Low',   color.new(c_sup_core, 0),          2)
+p_olo = plot(i_vov ? _olo : na, 'VoV Low',  color.new(c_sup_warn, _alpha_vov), 1, plot.style_linebr)
 
-// ── Band Lines ───────────────────────────────────────────────────
-p_ohi  = plot(i_vov ? _ohi : na,    'Outer High',  color.new(c_hi, 70), 1)
-p_ghi  = plot(i_vov ? _grd_hi : na, 'Grd High',    na,                  1, display=display.none)
-p_bhi  = plot(_bhi,                  '1σ High',     c_hi,                3)
-p_blo  = plot(_blo,                  '1σ Low',      c_lo,                3)
-p_glo  = plot(i_vov ? _grd_lo : na, 'Grd Low',     na,                  1, display=display.none)
-p_olo  = plot(i_vov ? _olo : na,    'Outer Low',   color.new(c_lo, 70), 1)
+fill(p_ohi, p_bhi, c_hi_vov, title='Upper Risk Zone')
+fill(p_olo, p_blo, c_lo_vov, title='Lower Risk Zone')
+fill(p_bhi, p_blo, color.new(color.rgb(10, 12, 18), 92), title='1σ Expected Range')
 
-// ── Fills: Inner Expected Range ──────────────────────────────────
-// Price-position-relative: tints toward whichever band price is nearest
-float _pos = _bhi != _blo ? (close - _blo) / (_bhi - _blo) : 0.5
-float _pos_c = math.max(0.0, math.min(_pos, 1.0))
+plot(i_anch ? _anch_ef : na, 'Anchor', c_anchor, 1, plot.style_line)
 
-color c_in_bot = color.rgb(0, 180, 140)
-color c_in_top = color.rgb(220, 60, 90)
-color c_inner_raw = color.from_gradient(_pos_c, 0.0, 1.0, c_in_bot, c_in_top)
-color c_inner = color.new(c_inner_raw, 92)
+// ── Candle Telemetry Nodes ───────────────────────────────────────
+// Visual confirmation when price interacts with risk zones.
+// Without off-chart artifacts, the candles become the sensors.
+bool _in_hi_risk = high >= _bhi and low <= _ohi and _bhi > 0
+bool _in_lo_risk = low <= _blo and high >= _olo and _blo > 0
+bool _brk_hi     = close > _ohi
+bool _brk_lo     = close < _olo
 
-fill(p_bhi, p_blo, c_inner, title='1σ Expected Range')
+color _bar_color = _brk_hi ? color.new(c_res_core, 0) :
+                   _brk_lo ? color.new(c_sup_core, 0) :
+                   _in_hi_risk ? color.new(c_res_warn, 30) :
+                   _in_lo_risk ? color.new(c_sup_warn, 30) : na
 
-// ── Fills: VoV Uncertainty Gradient ──────────────────────────────
-// Two-step gradient: outer layer more transparent than inner layer
-color c_vhi_bot = color.rgb(255, 80, 110)
-color c_vhi_top = color.rgb(255, 0, 68)
-color c_vov_hi_raw = color.from_gradient(_vov_n, 0.0, 1.0, c_vhi_bot, c_vhi_top)
-
-color c_vlo_bot = color.rgb(0, 185, 140)
-color c_vlo_top = color.rgb(0, 255, 170)
-color c_vov_lo_raw = color.from_gradient(_vov_n, 0.0, 1.0, c_vlo_bot, c_vlo_top)
-
-// Outer ring: more ghosted. Inner ring: slightly more visible.
-int _alpha_outer = math.round(97.0 - 5.0 * _vov_n)   // 97 → 92 as VoV rises
-int _alpha_inner = math.round(95.0 - 7.0 * _vov_n)   // 95 → 88 as VoV rises
-
-fill(p_ohi, p_ghi, color.new(c_vov_hi_raw, _alpha_outer), title='Upper VoV Outer')
-fill(p_ghi, p_bhi, color.new(c_vov_hi_raw, _alpha_inner), title='Upper VoV Inner')
-fill(p_blo, p_glo, color.new(c_vov_lo_raw, _alpha_inner), title='Lower VoV Inner')
-fill(p_glo, p_olo, color.new(c_vov_lo_raw, _alpha_outer), title='Lower VoV Outer')
-
-// ── Anchor Line ──────────────────────────────────────────────────
-plot(i_anch ? _anch_ef : na, 'Anchor',
-     color.new(c_anch, 35), 1, plot.style_circles)
-
-// ── Boundary Interaction Markers ─────────────────────────────────
-// Visual confirmation when price tests (diamond) or breaches (X) bands.
-// Without these, boundary respect is invisible to the naked eye.
-bool _tch_hi = high >= _bhi and high <= _ohi
-bool _tch_lo = low  <= _blo and low  >= _olo
-bool _brk_hi = high > _ohi
-bool _brk_lo = low  < _olo
-
-plotshape(_tch_hi ? _bhi : na, 'Touch High', shape.diamond,
-         location.absolute, color.rgb(255, 130, 170), size=size.tiny)
-plotshape(_tch_lo ? _blo : na, 'Touch Low',  shape.diamond,
-         location.absolute, color.rgb(80, 255, 190),  size=size.tiny)
-plotshape(_brk_hi ? high : na, 'Breach High', shape.xcross,
-         location.absolute, color.rgb(255, 40, 40),   size=size.small)
-plotshape(_brk_lo ? low : na,  'Breach Low',  shape.xcross,
-         location.absolute, color.rgb(255, 40, 40),   size=size.small)
+barcolor(_bar_color, title="Telemetry Bar Color")
 
 // ================================================================
 // MODEL STATE TABLE — GLASSMORPHIC DARK
 // ================================================================
-var table _T = table.new(position=position.top_right, columns=2, rows=9, bgcolor=color.rgb(12, 12, 20), frame_color=color.rgb(45, 45, 65), frame_width=1, border_color=color.rgb(60, 60, 85), border_width=1)
+var table _T = table.new(position=position.top_right, columns=2, rows=10, bgcolor=color.rgb(10, 10, 15, 10), frame_color=color.rgb(30, 30, 45, 0), frame_width=1, border_color=color.rgb(40, 40, 55, 50), border_width=1)
 
 if i_tbl and barstate.islast
     float _ann  = math.sqrt(_hv * 252.0) * 100.0
     float _pts  = (_bhi - _blo) * 0.5
     float _jann = math.sqrt(_jv * 252.0) * 100.0
-    color _hcol = _H > 0.52 ? color.rgb(255, 85, 100) :
-                  _H < 0.48 ? color.rgb(68, 255, 170)  : color.rgb(140, 145, 165)
-    color _dcol = _df > 1.2  ? color.rgb(255, 136, 68) :
-                  _df < 0.8  ? color.rgb(68, 136, 255) : color.rgb(140, 145, 165)
-    color _jcol = _jfl > 0.5 ? color.rgb(255, 136, 68) : color.rgb(70, 70, 90)
+    color _hcol = _H > 0.52 ? color.rgb(255, 30, 80) :
+                  _H < 0.48 ? color.rgb(0, 220, 160)  : color.rgb(140, 145, 165)
+    color _dcol = _df > 1.2  ? color.rgb(255, 170, 0) :
+                  _df < 0.8  ? color.rgb(0, 220, 160) : color.rgb(140, 145, 165)
+    color _jcol = _jfl > 0.5 ? color.rgb(255, 170, 0) : color.rgb(70, 70, 90)
 
-    f_row(_T, 0, 'IRP v3',      syminfo.ticker,                                   color.rgb(230, 230, 240))
+    string _sys_state = _vov_n > 0.75 ? "🔴 CHAOTIC" :
+                        _vov_n > 0.40 ? "🟡 ELEVATED" :
+                        "🟢 NOMINAL"
+    color _sys_col    = _vov_n > 0.75 ? color.rgb(255, 30, 80) :
+                        _vov_n > 0.40 ? color.rgb(255, 170, 0) :
+                        color.rgb(0, 220, 160)
+
+    f_row(_T, 0, 'SYS STATE',   _sys_state,                                        _sys_col)
     f_row(_T, 1, 'HAR Vol',     str.tostring(_ann, '#.##') + '%',                  color.rgb(255, 191, 36))
     f_row(_T, 2, 'β d/w/m',     str.tostring(_bd, '#.##') + ' / ' +
                                  str.tostring(_bw, '#.##') + ' / ' +
                                  str.tostring(_bm, '#.##'),                         color.rgb(140, 145, 165))
     f_row(_T, 3, 'Hurst  H',    str.tostring(_H, '#.###'),                         _hcol )
     f_row(_T, 4, 'Diurnal ×',   str.tostring(_df, '#.##'),                         _dcol )
-    f_row(_T, 5, 'Exp Move ±',  str.tostring(_pts, '#.#') + ' pts',                color.rgb(230, 230, 240))
-    f_row(_T, 6, 'Jump  Vol',   str.tostring(_jann, '#.##') + '%',                 _jcol )
-    f_row(_T, 7, 'Anchor',      str.tostring(_anch_ef, '#.##'),                     color.rgb(255, 191, 36))
+    f_row(_T, 5, 'Dir Skew',    str.tostring(_skew_ratio, '#.##'),                 _skew_ratio > 1.1 ? color.rgb(0, 255, 200) : _skew_ratio < 0.9 ? color.rgb(255, 0, 100) : color.rgb(140, 145, 165))
+    f_row(_T, 6, 'Exp Move',    '± ' + str.tostring(_pts, '#.#'),                  color.rgb(230, 230, 240))
+    f_row(_T, 7, 'Jump Vol',    str.tostring(_jann, '#.##') + '%',                 _jcol )
+    f_row(_T, 8, 'Anchor',      str.tostring(_anch_ef, '#.##'),                     color.rgb(255, 191, 36))
     bool _ols = math.abs(_bd - 0.36) > 1e-9 or math.abs(_bw - 0.28) > 1e-9 or math.abs(_bm - 0.28) > 1e-9
-    f_row(_T, 8, 'OLS Status', _ols ? 'OLS Active' : 'Warmup (Corsi)', _ols ? color.rgb(68, 255, 170) : color.rgb(255, 136, 68))
+    f_row(_T, 9, 'OLS Engine',  _ols ? 'Active' : 'Warmup',                        _ols ? color.rgb(0, 220, 160) : color.rgb(255, 170, 0))
 
 // ================================================================
 // DIAGNOSTIC CSV LOGGING

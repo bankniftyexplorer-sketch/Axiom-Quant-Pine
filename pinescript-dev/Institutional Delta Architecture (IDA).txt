@@ -1,0 +1,747 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © majhikeshab5
+
+//@version=6
+indicator("Institutional Delta Architecture (IDA)" , precision=3, overlay=false, max_boxes_count=500, max_labels_count=500, dynamic_requests=true)
+
+import bankniftyexplorer/kibrary/4 as k
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+length = input.int(12, title='Rsi Length', minval=1  , group = 'Rsi')
+smooth = input.int(2, title=' Smooth', minval=1  , group = 'Rsi')
+DECAY_FACTOR = input.float(0.99 , "DECAY_FACTOR", maxval = 1.0 , minval = 0.00001)
+
+candle_mrk_len  = input.int(60, title='Mark Length', minval=1)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+f_LastHLbar(series float high_src, series float low_src, series float linked_high ,series float linked_low) =>
+    var float candidateHigh = na
+    candidateHigh := high_src[1] > high_src[2] and high_src[1] > high_src ? math.max(linked_high[2] , linked_high[1] , linked_high): candidateHigh[1]
+
+    var float candidateLow = na
+    candidateLow := low_src[1] < low_src[2] and low_src[1] < low_src ? math.min(linked_low[2] ,linked_low[1] , linked_low) : candidateLow[1]
+    
+    [candidateHigh, candidateLow]
+
+f_mean_cross(mean_src ,o , c ,h ,l) =>
+    var float hh = na
+    var float ll = na
+    var float por = na // point of revarsal
+
+    kalman = k.f_kalman(mean_src,0.1,0.01)
+    condH = c[1] > kalman and c <= kalman or h > kalman and math.pow(o*c , 0.5) < kalman
+    condL = c[1] < kalman and c >= kalman or l < kalman and math.pow(o*c , 0.5) > kalman
+
+    por := condH ?  math.max(h,h[1]) : condL ? math.min(l[1] ,l) : por[1]
+    por
+
+CandleFix(float O , float H , float L , float C ) =>
+    fixnanO = fixnan(O)
+    fixnanH = fixnan(H)
+    fixnanL = fixnan(L)
+    fixnanC = fixnan(C)
+    fixnanV = na(fixnan(volume)) ? 1 : (volume)
+    [fixnanO , fixnanH , fixnanL , fixnanC , fixnanV ]
+
+
+f_4LegRsi(float FO, float FH, float FL, float FC, int length, int smooth) =>
+    o = ta.ema(ta.rsi(FO, length), smooth)
+    h = ta.ema(ta.rsi(math.max(FH,FC[1]), length), smooth)
+    l = ta.ema(ta.rsi(math.min(FL,FC[1]), length), smooth)
+    c = ta.ema(ta.rsi(FC, length), smooth)
+    
+    h := math.max(o, h, l, c)
+    l := math.min(o, h, l, c)
+    
+    [o , h ,l ,c]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DATA SOURCES & RSI CALCS
+// ═══════════════════════════════════════════════════════════════════════════
+[FO , FH , FL , FC , FV]= request.security(syminfo.tickerid , '' , CandleFix(open , high , low , close ) , lookahead = barmerge.lookahead_off)
+[hFO , hFH , hFL , hFC , hFV]= request.security(ticker.heikinashi(syminfo.tickerid) , '' , CandleFix(open , high , low , close ) , lookahead = barmerge.lookahead_off)
+
+[__open , __high , __low , __close] = k.f_4LegRsi(FO , FH , FL , FC , length,smooth)
+
+[delta , cumdelta] = k.f_CumulativeDelta(FO , FH , FL , FC , FV)
+rsi_delta = ta.ema(ta.rsi(cumdelta ,length) , smooth)
+[od , hd , ld , cd , avgd , dird] = k.HeikinAshi(rsi_delta[1] , rsi_delta)
+
+price_AvgRsi = math.avg(__open , __high , __low , __close)
+CombinedRsi =  ( price_AvgRsi - 50) + (rsi_delta - 50)
+
+[src_mx , src_mn ] = k.f_MxMn(__open , __high , __low ,__close)      
+src_mxmn = math.pow(__open*__high*__low*__close , 0.25)
+
+ma_src = f_mean_cross(src_mxmn ,__open,__close ,__high ,__low)
+
+// Map por for the Zone Gravity System
+float por = ma_src
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ZONE GRAVITY SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+var float[] ZONE_BOTTOM = array.from( 0.0, 23.6, 38.2, 50.0, 61.8, 78.6)
+var float[] ZONE_TOP    = array.from(23.6, 38.2, 50.0, 61.8, 78.6,100.0)
+
+int N_ZONES   = 6
+int N_BUCKETS = 4   
+
+var float[] visit_raw   = array.new_float(24, 0.0)  
+var float[] visit_delta = array.new_float(24, 0.0)  
+
+var float[] gravity_raw  = array.new_float(6, na )  
+var float[] gravity_k    = array.new_float(6, na )  
+var float[] kalman_p     = array.new_float(6, 0.1)  
+var float[] kalman_gain  = array.new_float(6, 1.0)  
+
+var int prev_zone = -1  
+
+f_getZone(float v) =>
+    int z = -1
+    if v >= 0.0 and v < 23.6
+        z := 0
+    else if v >= 23.6 and v < 38.2
+        z := 1
+    else if v >= 38.2 and v < 50.0
+        z := 2
+    else if v >= 50.0 and v < 61.8
+        z := 3
+    else if v >= 61.8 and v < 78.6
+        z := 4
+    else if v >= 78.6 and v <= 100.0
+        z := 5
+    z
+
+f_getBucket(float v, int zi) =>
+    float bot  = array.get(ZONE_BOTTOM, zi)
+    float top  = array.get(ZONE_TOP,    zi)
+    float band = (top - bot) / N_BUCKETS
+    int   b    = int(math.floor((v - bot) / band))
+    math.min(b, N_BUCKETS - 1)  
+
+f_bucketCenter(int zi, int bj) =>
+    float bot  = array.get(ZONE_BOTTOM, zi)
+    float top  = array.get(ZONE_TOP,    zi)
+    float band = (top - bot) / N_BUCKETS
+    bot + band * float(bj) + band * 0.5
+
+f_kalmanUpdate(int zi, float new_obs) =>
+    float Q      = 0.005
+    float R      = 0.5
+    float p_prev = array.get(kalman_p,    zi)
+    float p_pred = p_prev + Q
+    float gain   = p_pred / (p_pred + R)
+    float p_new  = (1.0 - gain) * p_pred
+
+    array.set(kalman_p,    zi, p_new)
+    array.set(kalman_gain, zi, gain)           
+
+    float prev_gk = array.get(gravity_k, zi)
+    float gk_new  = na(prev_gk) ? new_obs : prev_gk + gain * (new_obs - prev_gk)
+    array.set(gravity_k, zi, gk_new)
+    gk_new
+
+f_updateGravity(float src, float delta_w) =>
+    int zi = f_getZone(src)
+
+    if zi >= 0
+        int   bj    = f_getBucket(src, zi)
+        int   idx   = zi * N_BUCKETS + bj
+
+        array.set(visit_raw,   idx, array.get(visit_raw,   idx) + 1.0)
+        array.set(visit_delta, idx, array.get(visit_delta, idx) + math.abs(delta_w))
+
+        float best_w  = -1.0
+        int   best_bj = 0
+        for j = 0 to N_BUCKETS - 1
+            float w = array.get(visit_delta, zi * N_BUCKETS + j)
+            if w > best_w
+                best_w  := w
+                best_bj := j
+
+        float raw_g = f_bucketCenter(zi, best_bj)
+        array.set(gravity_raw, zi, raw_g)
+        f_kalmanUpdate(zi, raw_g)
+
+    zi
+
+for i = 0 to 23
+    array.set(visit_raw,   i, array.get(visit_raw,   i) * DECAY_FACTOR)
+    array.set(visit_delta, i, array.get(visit_delta, i) * DECAY_FACTOR)
+
+float delta_w  = rsi_delta - 50.0                         
+int   curr_z   = f_updateGravity(ma_src, delta_w)         
+prev_zone := curr_z
+
+float grav_z0 = array.get(gravity_k, 0)   
+float grav_z1 = array.get(gravity_k, 1)   
+float grav_z2 = array.get(gravity_k, 2)   
+float grav_z3 = array.get(gravity_k, 3)   
+float grav_z4 = array.get(gravity_k, 4)   
+float grav_z5 = array.get(gravity_k, 5)   
+
+plot(grav_z5, title='Attractor 78.6–100',  color=color.rgb(0, 0, 255), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z4, title='Attractor 61.8–78.6', color=color.rgb(0, 128, 255), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z3, title='Attractor 50–61.8',   color=color.new(color.rgb(0,255,0),  0), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z2, title='Attractor 38.2–50',   color=color.new(color.rgb(255,255,0), 0), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z1, title='Attractor 23.6–38.2', color=color.new(color.rgb(255,128,0), 0), linewidth=1 , linestyle = plot.linestyle_dotted)
+plot(grav_z0, title='Attractor 0–23.6',    color=color.new(color.rgb(255,0,0),    0), linewidth=1 , linestyle = plot.linestyle_dotted)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ORIGINAL CANDLE LOGIC & PLOTTING
+// ═══════════════════════════════════════════════════════════════════════════
+EMA(o,h,l,c , smooth) =>
+    s_o = ta.ema(o,smooth)
+    s_h = ta.ema(h,smooth)
+    s_l = ta.ema(l,smooth)
+    s_c = ta.ema(c,smooth)
+    [s_o , s_h , s_l , s_c]
+
+[s_o , s_h , s_l , s_c] = EMA(FO,FH,FL,FC ,smooth)
+
+minLevel = math.min(FC[1], FL)
+guard  = syminfo.mintick
+
+pc = ((math.max((FC -minLevel),guard) - math.max((FO - minLevel), guard)))*100/ math.max((math.max(FC[1], FH) - minLevel), guard)
+rsc = ( __close - __open)    
+
+ur = math.sum( rsc >= 0 and pc != 0 ?  rsc/pc : 0 , candle_mrk_len)
+ur_ = math.sum( rsc >= 0 ?  1 : 0 , candle_mrk_len )
+ur := (ur_ == 0 ? 0 : ur / ur_ )
+
+dr = math.sum(rsc < 0 and pc != 0 ?  (rsc/pc) : 0  , candle_mrk_len)
+dr_ = math.sum(rsc < 0 ?  1 : 0  , candle_mrk_len )
+dr := (dr_ == 0 ? 0 : dr / dr_ )
+
+grater_response = math.abs(ur) > math.abs(dr)
+
+float candle_range = math.max(__high , __close[1]) - math.min(__low , __close[1]) + math.max(hd , cd[1]) - math.min(ld , cd[1])
+max_candle = ta.highest(candle_range , candle_mrk_len ) == candle_range
+CombinedRsiCng = CombinedRsi >= CombinedRsi[1]
+
+color LargeCandle = max_candle  and CombinedRsi <= CombinedRsi[1] ? color.rgb(0,0,255) : max_candle and CombinedRsi > CombinedRsi[1]   ? color.rgb(255,255,0) : na
+
+color RsiUpCandle = max_candle and CombinedRsiCng ? color.rgb (255,255,0) : grater_response ?  color.rgb(0, 255, 0) : color.rgb(0,160,0)
+color RsiDownCandle = max_candle and not CombinedRsiCng? color.rgb (0,0,255) : not grater_response ?  color.rgb(255,0,0)   : color.rgb(160,0,160)
+
+plotcandle(  __open < __close  ? __open : na, __high, __low, __close, title='Rsi Ascending candle', color= RsiUpCandle, bordercolor = color.rgb(0,0,0), wickcolor = RsiUpCandle, editable=true)
+plotcandle(  __open > __close  ? __open : na, __high, __low, __close, title='Rsi Descending candle', color= RsiDownCandle, wickcolor =  RsiDownCandle, bordercolor = color.rgb(0,0,0), editable=true)
+
+barcolor( LargeCandle)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// [INJECTED] STRIKE PRICE DELTA PROFILE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Strike Profile Inputs ───────────────────────────────────────────────────
+string sdp_exp     = input.string("260415", "Options Expiry YYMMDD",
+  group="Strike Delta Profile",
+  tooltip="TradingView expiry in YYMMDD format. Check any option ticker for the date.")
+int    sdp_atm_in  = input.int(23800, "ATM Strike Price",
+  group="Strike Delta Profile",
+  tooltip="Set to the nearest round strike of current spot. Example: if NIFTY is 23775, enter 23800 (step=50) or 23800 (step=100).")
+int    sdp_offset  = input.int(20, "Profile Right Offset (bars)", minval=5, maxval=100,
+  group="Strike Delta Profile")
+int    sdp_width   = input.int(50, "Max Box Width (bars)", minval=10, maxval=200,
+  group="Strike Delta Profile")
+
+bool   sdp_show    = input.bool(true, "Show Strike Profile",
+  group="Strike Delta Profile")
+bool   sdp_show_diag = input.bool(true, "Show Meticulous Debug",
+  group="Strike Delta Profile", tooltip="Shows the exact asset mappings and request strings to help debug why symbols aren't returning data.")
+string sdp_reset_mode = input.string("Daily", "Percentage Text Reset",
+  options=["Daily", "Weekly", "Monthly"], group="Strike Delta Profile",
+  tooltip="Freezes each strike's cumulative baseline internally at the first bar of the period in order to output the correct session text change (e.g. +5.5%).")
+
+// ─── Asset Guard ─────────────────────────────────────────────────────────────
+bool sdp_active = (syminfo.type == "index" and (str.contains(syminfo.prefix, "NSE") or str.contains(syminfo.prefix, "BSE"))) or syminfo.prefix == "MCX" or (syminfo.prefix == "NSE" and syminfo.root == "MCX")
+
+// ─── Auto Step Detection ─────────────────────────────────────────────────────
+int sdp_step = 50 // Default for Nifty, Finnifty, etc.
+if str.contains(syminfo.root, "BANKNIFTY") or str.contains(syminfo.root, "SENSEX") or str.contains(syminfo.root, "BANKEX") or str.contains(syminfo.root, "NIFTYNXT50") or str.contains(syminfo.root, "NIFTYJR")
+    sdp_step := 100
+else if str.contains(syminfo.root, "MIDCPNIFTY") or str.contains(syminfo.root, "NIFTY_MID_SELECT")
+    sdp_step := 25
+else if syminfo.prefix == "NSE" and syminfo.root == "MCX"
+    sdp_step := 20 // The NSE:MCX stock options typically trade in steps of 20
+else if syminfo.prefix == "MCX"
+    if str.contains(syminfo.root, "SILVER")
+        sdp_step := 500
+    else if str.contains(syminfo.root, "CRUDEOIL") or str.contains(syminfo.root, "GOLD")
+        sdp_step := 100
+    else if str.contains(syminfo.root, "NATURALGAS")
+        sdp_step := 5
+
+// Auto-snap the user's ATM input to perfectly align with the step grid 
+// (e.g. if user types 77550 on Sensex, it snaps to 77600 to prevent NaN requests)
+int sdp_atm = int(math.round(sdp_atm_in / float(sdp_step)) * float(sdp_step))
+
+// ─── Cumulative Net Delta Engine ─────────────────────────────────────────────
+f_sdp_cum_delta() =>
+    float _tw       = math.max(high, close[1]) - math.max(open, close)
+    float _bw       = math.min(open, close)    - math.min(low, close[1])
+    float _body     = math.abs(open - close)
+    float _tw_sq    = _tw * _tw
+    float _bw_sq    = _bw * _bw
+    float _body_sq  = _body * _body
+    float _total_sq = _tw_sq + _bw_sq + _body_sq
+    bool  _bullish  = (_bw + (close - open) - _tw) >= 0
+    float _buy_sh   = _bw_sq + (_bullish     ? _body_sq : 0)
+    float _sell_sh  = _tw_sq + (not _bullish ? _body_sq : 0)
+    float _buy_pct  = _total_sq > 0 ? _buy_sh  / _total_sq : 0.5
+    float _sell_pct = _total_sq > 0 ? _sell_sh / _total_sq : 0.5
+    float _net_tick = nz(volume, 0) * (_bullish ? _buy_pct  : - _sell_pct)
+    ta.cum(_net_tick)
+
+// ─── Option Root & Prefix Mapping ────────────────────────────────────────────
+// Clean the prefix (removes _DLY or other feed tags)
+string sdp_opt_prefix = syminfo.prefix == "MCX" ? "MCX" : str.contains(syminfo.prefix, "BSE") ? "BSE" : "NSE"
+
+string sdp_opt_root = syminfo.root
+if syminfo.root == "SENSEX"
+    sdp_opt_root := "BSX"
+else if syminfo.root == "BANKEX"
+    sdp_opt_root := "BKX"
+else if str.contains(syminfo.root, "CNXFINANCE")
+    sdp_opt_root := "FINNIFTY"
+else if str.contains(syminfo.root, "NIFTY_MID_SELECT")
+    sdp_opt_root := "MIDCPNIFTY"
+else if str.contains(syminfo.root, "NIFTYJR")
+    sdp_opt_root := "NIFTYNXT50"
+
+f_sdp_tk(int strike, string opt_type) =>
+    sdp_opt_prefix + ":" + sdp_opt_root + sdp_exp + opt_type + str.tostring(strike)
+
+// ─── Security Calls: 19 Strikes × 2 Legs = 38 Requests ─────────────────────
+f_fetch_both() =>
+    [math.avg(open, high, low, close), f_sdp_cum_delta()]
+
+[ce_o4_u9, sdp_ce_u9] = request.security(f_sdp_tk(sdp_atm + 9*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u9, sdp_pe_u9] = request.security(f_sdp_tk(sdp_atm + 9*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u8, sdp_ce_u8] = request.security(f_sdp_tk(sdp_atm + 8*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u8, sdp_pe_u8] = request.security(f_sdp_tk(sdp_atm + 8*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u7, sdp_ce_u7] = request.security(f_sdp_tk(sdp_atm + 7*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u7, sdp_pe_u7] = request.security(f_sdp_tk(sdp_atm + 7*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u6, sdp_ce_u6] = request.security(f_sdp_tk(sdp_atm + 6*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u6, sdp_pe_u6] = request.security(f_sdp_tk(sdp_atm + 6*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u5, sdp_ce_u5] = request.security(f_sdp_tk(sdp_atm + 5*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u5, sdp_pe_u5] = request.security(f_sdp_tk(sdp_atm + 5*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u4, sdp_ce_u4] = request.security(f_sdp_tk(sdp_atm + 4*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u4, sdp_pe_u4] = request.security(f_sdp_tk(sdp_atm + 4*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u3, sdp_ce_u3] = request.security(f_sdp_tk(sdp_atm + 3*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u3, sdp_pe_u3] = request.security(f_sdp_tk(sdp_atm + 3*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u2, sdp_ce_u2] = request.security(f_sdp_tk(sdp_atm + 2*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u2, sdp_pe_u2] = request.security(f_sdp_tk(sdp_atm + 2*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_u1, sdp_ce_u1] = request.security(f_sdp_tk(sdp_atm + 1*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_u1, sdp_pe_u1] = request.security(f_sdp_tk(sdp_atm + 1*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_0,  sdp_ce_0]  = request.security(f_sdp_tk(sdp_atm,              "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_0,  sdp_pe_0]  = request.security(f_sdp_tk(sdp_atm,              "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d1, sdp_ce_d1] = request.security(f_sdp_tk(sdp_atm - 1*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d1, sdp_pe_d1] = request.security(f_sdp_tk(sdp_atm - 1*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d2, sdp_ce_d2] = request.security(f_sdp_tk(sdp_atm - 2*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d2, sdp_pe_d2] = request.security(f_sdp_tk(sdp_atm - 2*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d3, sdp_ce_d3] = request.security(f_sdp_tk(sdp_atm - 3*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d3, sdp_pe_d3] = request.security(f_sdp_tk(sdp_atm - 3*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d4, sdp_ce_d4] = request.security(f_sdp_tk(sdp_atm - 4*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d4, sdp_pe_d4] = request.security(f_sdp_tk(sdp_atm - 4*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d5, sdp_ce_d5] = request.security(f_sdp_tk(sdp_atm - 5*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d5, sdp_pe_d5] = request.security(f_sdp_tk(sdp_atm - 5*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d6, sdp_ce_d6] = request.security(f_sdp_tk(sdp_atm - 6*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d6, sdp_pe_d6] = request.security(f_sdp_tk(sdp_atm - 6*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d7, sdp_ce_d7] = request.security(f_sdp_tk(sdp_atm - 7*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d7, sdp_pe_d7] = request.security(f_sdp_tk(sdp_atm - 7*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d8, sdp_ce_d8] = request.security(f_sdp_tk(sdp_atm - 8*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d8, sdp_pe_d8] = request.security(f_sdp_tk(sdp_atm - 8*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[ce_o4_d9, sdp_ce_d9] = request.security(f_sdp_tk(sdp_atm - 9*sdp_step, "C"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+[pe_o4_d9, sdp_pe_d9] = request.security(f_sdp_tk(sdp_atm - 9*sdp_step, "P"), timeframe.period, f_fetch_both(), ignore_invalid_symbol=true)
+
+// ─── Helpers Formatting Labels ───────────────────────────────────────────────
+f_pct_str(float current_val, float base_val) =>
+    float pct = na
+    if not na(current_val) and not na(base_val) and math.abs(base_val) > 0.000001
+        pct := (current_val - base_val) * 100.0 / math.abs(base_val)
+    na(pct) ? "--" : pct > 0 ? "+" + str.tostring(pct, "#.0") + "%" : str.tostring(pct, "#.0") + "%"
+
+f_pct_col(float current_val, float base_val) =>
+    float pct = na
+    if not na(current_val) and not na(base_val) and math.abs(base_val) > 0.000001
+        pct := (current_val - base_val) * 100.0 / math.abs(base_val)
+    na(pct) ? color.silver : pct > 0 ? color.rgb(0, 255, 0) : pct < 0 ? color.rgb(255, 0, 40) : color.white
+
+// ─── Drawing Engine Arrays ───────────────────────────────────────────────────
+var box[]   sdp_boxes     = array.new<box>()
+var label[] pct_labels    = array.new<label>()
+var label   sdp_debug_lbl = na
+
+// Arrays dedicated to locking the baseline ONLY for the percentage text math
+var float[] sdp_base_values = array.new_float(19, na)
+
+// ─── Snapshot Baseline Logic ─────────────────────────────────────────────────
+bool sdp_session_open = ta.change(time("D")) != 0
+bool sdp_new_week = ta.change(time("W")) != 0
+bool sdp_new_month = ta.change(time("M")) != 0
+
+bool sdp_reset_bar = sdp_session_open
+if sdp_reset_mode == "Weekly"
+    sdp_reset_bar := sdp_session_open and sdp_new_week
+else if sdp_reset_mode == "Monthly"
+    sdp_reset_bar := sdp_session_open and sdp_new_month
+
+// Target the explicit closing value of the previous day [1] when a new session begins
+if sdp_reset_bar
+    array.set(sdp_base_values, 0,  na(sdp_ce_u9[1]) ? na : nz(sdp_ce_u9[1]) - nz(sdp_pe_u9[1]))
+    array.set(sdp_base_values, 1,  na(sdp_ce_u8[1]) ? na : nz(sdp_ce_u8[1]) - nz(sdp_pe_u8[1]))
+    array.set(sdp_base_values, 2,  na(sdp_ce_u7[1]) ? na : nz(sdp_ce_u7[1]) - nz(sdp_pe_u7[1]))
+    array.set(sdp_base_values, 3,  na(sdp_ce_u6[1]) ? na : nz(sdp_ce_u6[1]) - nz(sdp_pe_u6[1]))
+    array.set(sdp_base_values, 4,  na(sdp_ce_u5[1]) ? na : nz(sdp_ce_u5[1]) - nz(sdp_pe_u5[1]))
+    array.set(sdp_base_values, 5,  na(sdp_ce_u4[1]) ? na : nz(sdp_ce_u4[1]) - nz(sdp_pe_u4[1]))
+    array.set(sdp_base_values, 6,  na(sdp_ce_u3[1]) ? na : nz(sdp_ce_u3[1]) - nz(sdp_pe_u3[1]))
+    array.set(sdp_base_values, 7,  na(sdp_ce_u2[1]) ? na : nz(sdp_ce_u2[1]) - nz(sdp_pe_u2[1]))
+    array.set(sdp_base_values, 8,  na(sdp_ce_u1[1]) ? na : nz(sdp_ce_u1[1]) - nz(sdp_pe_u1[1]))
+    array.set(sdp_base_values, 9,  na(sdp_ce_0[1])  ? na : nz(sdp_ce_0[1])  - nz(sdp_pe_0[1]))
+    array.set(sdp_base_values, 10, na(sdp_ce_d1[1]) ? na : nz(sdp_ce_d1[1]) - nz(sdp_pe_d1[1]))
+    array.set(sdp_base_values, 11, na(sdp_ce_d2[1]) ? na : nz(sdp_ce_d2[1]) - nz(sdp_pe_d2[1]))
+    array.set(sdp_base_values, 12, na(sdp_ce_d3[1]) ? na : nz(sdp_ce_d3[1]) - nz(sdp_pe_d3[1]))
+    array.set(sdp_base_values, 13, na(sdp_ce_d4[1]) ? na : nz(sdp_ce_d4[1]) - nz(sdp_pe_d4[1]))
+    array.set(sdp_base_values, 14, na(sdp_ce_d5[1]) ? na : nz(sdp_ce_d5[1]) - nz(sdp_pe_d5[1]))
+    array.set(sdp_base_values, 15, na(sdp_ce_d6[1]) ? na : nz(sdp_ce_d6[1]) - nz(sdp_pe_d6[1]))
+    array.set(sdp_base_values, 16, na(sdp_ce_d7[1]) ? na : nz(sdp_ce_d7[1]) - nz(sdp_pe_d7[1]))
+    array.set(sdp_base_values, 17, na(sdp_ce_d8[1]) ? na : nz(sdp_ce_d8[1]) - nz(sdp_pe_d8[1]))
+    array.set(sdp_base_values, 18, na(sdp_ce_d9[1]) ? na : nz(sdp_ce_d9[1]) - nz(sdp_pe_d9[1]))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHYSICS ENGINE V2 — 31-POINT KINEMATIC COMPARATOR
+// ═══════════════════════════════════════════════════════════════════════════
+// Replaces Spearman correlation. Zero lookback-window dependency.
+// Scores CE & PE independently via structural derivative chain.
+// Dominance = CE_score − PE_score captures institutional reaction directly.
+
+// ─── Cumulative Log Return: LEVEL series for physics engine input ────────
+// Overnight gap filter: zeroes the first bar's log return at each daily session
+// boundary to prevent overnight repricing from contaminating the derivative chain.
+// Without this, the first 8 bars of each session carry artificial momentum from
+// the gap — tolerable on 1-min (8 min), unacceptable on 15-min (2 hrs) and 60-min (8 hrs).
+f_cum_log_ret(float src) =>
+    float lr = src > 0 and nz(src[1]) > 0 ? math.log(src / nz(src[1])) : 0.0
+    ta.cum(ta.change(time("D")) != 0 ? 0.0 : lr)
+
+// ─── 31-Point Structural Score ∈ [-1, +1] ───────────────────────────────
+f_structural_score(float p) =>
+    if bar_index < 10
+        [0.0, 0.0]
+    else
+        float score = 0.0
+        float _eps  = 1e-6
+        float _dz   = 1e-8
+
+        d1     = p - p[1]
+        d2     = p - 2*p[1] + p[2]
+        d3     = p - 3*p[1] + 3*p[2] - p[3]
+        d4     = p - 4*p[1] + 6*p[2] - 4*p[3] + p[4]
+
+        d2_e   = p - 2*p[2] + p[4]
+        d2_o   = p[1] - 2*p[3] + p[5]
+        d3_e   = p - 3*p[2] + 3*p[4] - p[6]
+        d3_o   = p[1] - 3*p[3] + 3*p[5] - p[7]
+
+        d1_x   = p - p[1] - p[2] + p[3]
+        d2_x   = p - p[1] - 2*p[2] + 2*p[3] + p[4] - p[5]
+        convex = 2*p - p[1] - p[2]
+
+        E2_1 = d2 / math.max(math.abs(d1), _eps)
+        E4_3 = d4 / math.max(math.abs(d3), _eps)
+
+        score += math.abs(d1)     < _dz ? 0.0 : d1     >= 0 ? 1.0 : -1.0
+        score += math.abs(d1_x)   < _dz ? 0.0 : d1_x   >= 0 ? 1.0 : -1.0
+        score += math.abs(d2)     < _dz ? 0.0 : d2     >= 0 ? 2.0 : -2.0
+        score += math.abs(d2_e)   < _dz ? 0.0 : d2_e   >= 0 ? 2.0 : -2.0
+        score += math.abs(d2_o)   < _dz ? 0.0 : d2_o   >= 0 ? 2.0 : -2.0
+        score += math.abs(d2_x)   < _dz ? 0.0 : d2_x   >= 0 ? 2.0 : -2.0
+        score += math.abs(convex) < _dz ? 0.0 : convex >= 0 ? 2.0 : -2.0
+        score += math.abs(d3)     < _dz ? 0.0 : d3     >= 0 ? 3.0 : -3.0
+        score += math.abs(d3_e)   < _dz ? 0.0 : d3_e   >= 0 ? 3.0 : -3.0
+        score += math.abs(d3_o)   < _dz ? 0.0 : d3_o   >= 0 ? 3.0 : -3.0
+        score += math.abs(d4)     < _dz ? 0.0 : d4     >= 0 ? 4.0 : -4.0
+
+        score += E2_1 >= nz(E2_1[1]) ? 1.0 : -1.0
+        score += E4_3 >= nz(E4_3[1]) ? 1.0 : -1.0
+
+        score += (d1 > _dz and d2 > _dz and d3 > _dz) ? 1.0 : -1.0
+        score += (d1 < -_dz and d2 < -_dz and d3 < -_dz) ? -1.0 : 1.0
+
+        score += (d1 > _dz and d2 > _dz and math.abs(d1) > math.abs(nz(d1[1]))) ? 1.0 : -1.0
+        score += (d1 < -_dz and d2 < -_dz and math.abs(d1) > math.abs(nz(d1[1]))) ? -1.0 : 1.0
+
+        [score / 31.0, d1]
+
+// ─── Per-Strike Evaluation ──────────────────────────────────────────────
+// Returns: [dominance ∈ [-2,+2], weight, ce_velocity, pe_velocity]
+f_eval_strike(float ce_price, float pe_price, float idx_atr) =>
+    ce_cum = f_cum_log_ret(ce_price)
+    pe_cum = f_cum_log_ret(pe_price)
+
+    [ce_score, ce_vel] = f_structural_score(ce_cum)
+    [pe_score, pe_vel] = f_structural_score(pe_cum)
+
+    float dominance = ce_score - pe_score
+
+    float ce_chg = math.abs(nz(ce_price) - nz(ce_price[1]))
+    float pe_chg = math.abs(nz(pe_price) - nz(pe_price[1]))
+    float weight = (ce_chg + pe_chg) / math.max(idx_atr, 1e-6)
+
+    [dominance, weight, ce_vel, pe_vel]
+
+// ─── Index ATR for weight normalization ─────────────────────────────────
+float idx_atr = ta.atr(14)
+
+// ─── Per-Strike Physics Evaluation (19 strikes) ─────────────────────────
+[g_u9, w_u9, cv_u9, pv_u9] = f_eval_strike(ce_o4_u9, pe_o4_u9, idx_atr)
+[g_u8, w_u8, cv_u8, pv_u8] = f_eval_strike(ce_o4_u8, pe_o4_u8, idx_atr)
+[g_u7, w_u7, cv_u7, pv_u7] = f_eval_strike(ce_o4_u7, pe_o4_u7, idx_atr)
+[g_u6, w_u6, cv_u6, pv_u6] = f_eval_strike(ce_o4_u6, pe_o4_u6, idx_atr)
+[g_u5, w_u5, cv_u5, pv_u5] = f_eval_strike(ce_o4_u5, pe_o4_u5, idx_atr)
+[g_u4, w_u4, cv_u4, pv_u4] = f_eval_strike(ce_o4_u4, pe_o4_u4, idx_atr)
+[g_u3, w_u3, cv_u3, pv_u3] = f_eval_strike(ce_o4_u3, pe_o4_u3, idx_atr)
+[g_u2, w_u2, cv_u2, pv_u2] = f_eval_strike(ce_o4_u2, pe_o4_u2, idx_atr)
+[g_u1, w_u1, cv_u1, pv_u1] = f_eval_strike(ce_o4_u1, pe_o4_u1, idx_atr)
+[g_0,  w_0,  cv_0,  pv_0]  = f_eval_strike(ce_o4_0,  pe_o4_0,  idx_atr)
+[g_d1, w_d1, cv_d1, pv_d1] = f_eval_strike(ce_o4_d1, pe_o4_d1, idx_atr)
+[g_d2, w_d2, cv_d2, pv_d2] = f_eval_strike(ce_o4_d2, pe_o4_d2, idx_atr)
+[g_d3, w_d3, cv_d3, pv_d3] = f_eval_strike(ce_o4_d3, pe_o4_d3, idx_atr)
+[g_d4, w_d4, cv_d4, pv_d4] = f_eval_strike(ce_o4_d4, pe_o4_d4, idx_atr)
+[g_d5, w_d5, cv_d5, pv_d5] = f_eval_strike(ce_o4_d5, pe_o4_d5, idx_atr)
+[g_d6, w_d6, cv_d6, pv_d6] = f_eval_strike(ce_o4_d6, pe_o4_d6, idx_atr)
+[g_d7, w_d7, cv_d7, pv_d7] = f_eval_strike(ce_o4_d7, pe_o4_d7, idx_atr)
+[g_d8, w_d8, cv_d8, pv_d8] = f_eval_strike(ce_o4_d8, pe_o4_d8, idx_atr)
+[g_d9, w_d9, cv_d9, pv_d9] = f_eval_strike(ce_o4_d9, pe_o4_d9, idx_atr)
+
+// ─── Aggregated ComparatorScore ∈ [-1, +1] with Regime Filters ──────────
+f_comparator_feature(array<float> arr_dom, array<float> arr_wt, array<float> arr_cv, array<float> arr_pv, float idx_price, float _idx_atr) =>
+    float sum_dw    = 0.0
+    float sum_w     = 0.0
+    int   n_vol_exp = 0
+    int size = array.size(arr_dom)
+    if size > 0
+        for i = 0 to size - 1
+            d  = array.get(arr_dom, i)
+            w  = array.get(arr_wt,  i)
+            cv = array.get(arr_cv, i)
+            pv = array.get(arr_pv, i)
+            sum_dw += d * w
+            sum_w  += w
+            if cv > 1e-5 and pv > 1e-5
+                n_vol_exp += 1
+    float raw     = sum_w > 0 ? sum_dw / sum_w : 0.0
+    float clamped = math.max(-1.0, math.min(1.0, raw / 2.0))
+    // Index structural confidence
+    idx_cum = f_cum_log_ret(idx_price)
+    [idx_score, _iv] = f_structural_score(idx_cum)
+    float idx_activity = math.abs(idx_score)
+    float idx_confidence = math.min(1.0, idx_activity / 0.5)
+    // Vol expansion penalty (sigmoid)
+    float vol_frac    = size > 0 ? float(n_vol_exp) / float(size) : 0.0
+    float vol_penalty = 1.0 / (1.0 + math.exp(10.0 * (vol_frac - 0.2)))
+    // Noise floor (ATR-based linear ramp)
+    float noise_floor   = 0.005 * size
+    float noise_penalty = math.min(1.0, sum_w / math.max(noise_floor, 1e-6))
+    // Concentration (HHI)
+    float hhi = 0.0
+    if size > 0 and sum_w > 0
+        for i = 0 to size - 1
+            float share = array.get(arr_wt, i) / sum_w
+            hhi += share * share
+    float hhi_uniform  = size > 0 ? 1.0 / float(size) : 1.0
+    float conc_ratio   = (hhi - hhi_uniform) / math.max(1.0 - hhi_uniform, 1e-6)
+    float conc_penalty = math.max(0.1, math.min(1.0, conc_ratio * 1.0))
+    float penalty = vol_penalty * noise_penalty * conc_penalty * idx_confidence
+    clamped * penalty
+
+// ─── Build aggregation arrays & compute ComparatorScore ─────────────────
+var float[] arr_dom = array.new_float(19, 0.0)
+var float[] arr_wt  = array.new_float(19, 0.0)
+var float[] arr_cv  = array.new_float(19, 0.0)
+var float[] arr_pv  = array.new_float(19, 0.0)
+
+array.set(arr_dom, 0,  g_u9),  array.set(arr_wt, 0,  w_u9),  array.set(arr_cv, 0,  cv_u9),  array.set(arr_pv, 0,  pv_u9)
+array.set(arr_dom, 1,  g_u8),  array.set(arr_wt, 1,  w_u8),  array.set(arr_cv, 1,  cv_u8),  array.set(arr_pv, 1,  pv_u8)
+array.set(arr_dom, 2,  g_u7),  array.set(arr_wt, 2,  w_u7),  array.set(arr_cv, 2,  cv_u7),  array.set(arr_pv, 2,  pv_u7)
+array.set(arr_dom, 3,  g_u6),  array.set(arr_wt, 3,  w_u6),  array.set(arr_cv, 3,  cv_u6),  array.set(arr_pv, 3,  pv_u6)
+array.set(arr_dom, 4,  g_u5),  array.set(arr_wt, 4,  w_u5),  array.set(arr_cv, 4,  cv_u5),  array.set(arr_pv, 4,  pv_u5)
+array.set(arr_dom, 5,  g_u4),  array.set(arr_wt, 5,  w_u4),  array.set(arr_cv, 5,  cv_u4),  array.set(arr_pv, 5,  pv_u4)
+array.set(arr_dom, 6,  g_u3),  array.set(arr_wt, 6,  w_u3),  array.set(arr_cv, 6,  cv_u3),  array.set(arr_pv, 6,  pv_u3)
+array.set(arr_dom, 7,  g_u2),  array.set(arr_wt, 7,  w_u2),  array.set(arr_cv, 7,  cv_u2),  array.set(arr_pv, 7,  pv_u2)
+array.set(arr_dom, 8,  g_u1),  array.set(arr_wt, 8,  w_u1),  array.set(arr_cv, 8,  cv_u1),  array.set(arr_pv, 8,  pv_u1)
+array.set(arr_dom, 9,  g_0),   array.set(arr_wt, 9,  w_0),   array.set(arr_cv, 9,  cv_0),   array.set(arr_pv, 9,  pv_0)
+array.set(arr_dom, 10, g_d1),  array.set(arr_wt, 10, w_d1),  array.set(arr_cv, 10, cv_d1),  array.set(arr_pv, 10, pv_d1)
+array.set(arr_dom, 11, g_d2),  array.set(arr_wt, 11, w_d2),  array.set(arr_cv, 11, cv_d2),  array.set(arr_pv, 11, pv_d2)
+array.set(arr_dom, 12, g_d3),  array.set(arr_wt, 12, w_d3),  array.set(arr_cv, 12, cv_d3),  array.set(arr_pv, 12, pv_d3)
+array.set(arr_dom, 13, g_d4),  array.set(arr_wt, 13, w_d4),  array.set(arr_cv, 13, cv_d4),  array.set(arr_pv, 13, pv_d4)
+array.set(arr_dom, 14, g_d5),  array.set(arr_wt, 14, w_d5),  array.set(arr_cv, 14, cv_d5),  array.set(arr_pv, 14, pv_d5)
+array.set(arr_dom, 15, g_d6),  array.set(arr_wt, 15, w_d6),  array.set(arr_cv, 15, cv_d6),  array.set(arr_pv, 15, pv_d6)
+array.set(arr_dom, 16, g_d7),  array.set(arr_wt, 16, w_d7),  array.set(arr_cv, 16, cv_d7),  array.set(arr_pv, 16, pv_d7)
+array.set(arr_dom, 17, g_d8),  array.set(arr_wt, 17, w_d8),  array.set(arr_cv, 17, cv_d8),  array.set(arr_pv, 17, pv_d8)
+array.set(arr_dom, 18, g_d9),  array.set(arr_wt, 18, w_d9),  array.set(arr_cv, 18, cv_d9),  array.set(arr_pv, 18, pv_d9)
+
+float ComparatorScore = f_comparator_feature(arr_dom, arr_wt, arr_cv, arr_pv, close, idx_atr)
+
+f_relative_rank(float[] arr, float val) =>
+    float min_v = val
+    float max_v = val
+    for i = 0 to array.size(arr) - 1
+        float v = array.get(arr, i)
+        if not na(v)
+            if na(min_v) or v < min_v
+                min_v := v
+            if na(max_v) or v > max_v
+                max_v := v
+    float range_v = max_v - min_v
+    range_v > 0 ? (val - min_v) * 100.0 / range_v : 100.0
+
+if barstate.islast and sdp_show and sdp_active
+    // Gather all current net values identically to the user's working code
+    float[] sdp_net = array.from(
+      nz(sdp_ce_u9) - nz(sdp_pe_u9),
+      nz(sdp_ce_u8) - nz(sdp_pe_u8),
+      nz(sdp_ce_u7) - nz(sdp_pe_u7),
+      nz(sdp_ce_u6) - nz(sdp_pe_u6),
+      nz(sdp_ce_u5) - nz(sdp_pe_u5),
+      nz(sdp_ce_u4) - nz(sdp_pe_u4),
+      nz(sdp_ce_u3) - nz(sdp_pe_u3),
+      nz(sdp_ce_u2) - nz(sdp_pe_u2),
+      nz(sdp_ce_u1) - nz(sdp_pe_u1),
+      nz(sdp_ce_0)  - nz(sdp_pe_0),
+      nz(sdp_ce_d1) - nz(sdp_pe_d1),
+      nz(sdp_ce_d2) - nz(sdp_pe_d2),
+      nz(sdp_ce_d3) - nz(sdp_pe_d3),
+      nz(sdp_ce_d4) - nz(sdp_pe_d4),
+      nz(sdp_ce_d5) - nz(sdp_pe_d5),
+      nz(sdp_ce_d6) - nz(sdp_pe_d6),
+      nz(sdp_ce_d7) - nz(sdp_pe_d7),
+      nz(sdp_ce_d8) - nz(sdp_pe_d8),
+      nz(sdp_ce_d9) - nz(sdp_pe_d9)
+     )
+
+    float[] gross_arr = array.from(g_u9, g_u8, g_u7, g_u6, g_u5, g_u4, g_u3, g_u2, g_u1, g_0, g_d1, g_d2, g_d3, g_d4, g_d5, g_d6, g_d7, g_d8, g_d9)
+    float[] wt_arr    = array.from(w_u9, w_u8, w_u7, w_u6, w_u5, w_u4, w_u3, w_u2, w_u1, w_0, w_d1, w_d2, w_d3, w_d4, w_d5, w_d6, w_d7, w_d8, w_d9)
+
+    // Purge previous frame drawings
+    if array.size(sdp_boxes) > 0
+        for i = 0 to array.size(sdp_boxes) - 1
+            box.delete(array.get(sdp_boxes, i))
+        array.clear(sdp_boxes)
+
+    if array.size(pct_labels) > 0
+        for i = 0 to array.size(pct_labels) - 1
+            label.delete(array.get(pct_labels, i))
+        array.clear(pct_labels)
+
+    // Compute normalization values (USER'S ORIGINAL METRIC)
+    float total_abs = 0.0
+    float sdp_max   = 0.0
+    for i = 0 to 18
+        float abs_val = math.abs(array.get(sdp_net, i))
+        total_abs    += abs_val
+        sdp_max      := math.max(sdp_max, abs_val)
+
+    float min_net = array.min(sdp_net)
+    float max_net = array.max(sdp_net)
+
+    // Render 19 profile boxes
+    int   sdp_x1 = bar_index + sdp_offset
+    float step_f = float(sdp_step)
+
+    for i = 0 to 18
+        float val        = array.get(sdp_net, i)
+        float base_val   = array.get(sdp_base_values, i)
+        float strike_lvl = float(sdp_atm + ((9 - i) * sdp_step))
+
+        // WIDTH: normalized by max absolute delta (longest bar = 100%)
+        float width_pct = sdp_max > 0 ? (math.abs(val) / sdp_max) : 0.0
+        int   sdp_x2    = sdp_x1 + math.max(2, math.round(sdp_width * width_pct))
+
+        color clr = color.from_gradient(val, min_net, max_net, color.rgb(255, 0, 0), color.rgb(0, 255, 0))
+
+        color bg  = color.new(clr, 0)
+        color brd = clr
+
+        // Box: 60% height fill, 40% gap between stacked boxes
+        int strike_int = sdp_atm + ((9 - i) * sdp_step)
+        box bx = box.new(sdp_x1, strike_lvl + (step_f * 0.30),
+                         sdp_x2, strike_lvl - (step_f * 0.30),
+                         bgcolor=bg, border_color=brd,
+                         text=str.tostring(strike_int), text_color=color.rgb(0,96,255),
+                         text_size=size.small, text_halign=text.align_center,
+                         text_valign=text.align_center,
+                         xloc=xloc.bar_index, force_overlay=true)
+        array.push(sdp_boxes, bx)
+        
+        // PCT CHANGE LABEL + PHYSICS ENGINE DOMINANCE
+        float g_val      = array.get(gross_arr, i)
+        float w_val      = array.get(wt_arr, i)
+        string rank_str  = na(g_val) ? "--" : str.tostring(f_relative_rank(gross_arr, g_val), "#") + "%"
+        string dom_sign  = na(g_val) ? "" : g_val >= 0 ? "▲" : "▼"
+        string dom_str   = na(g_val) ? "--" : dom_sign + " " + str.tostring(math.abs(g_val), "#.##")
+        color  dom_clr   = na(g_val) ? color.silver : g_val > 0.3 ? color.rgb(0, 255, 100) : g_val > 0 ? color.rgb(100, 255, 100) : g_val > -0.3 ? color.rgb(255, 120, 120) : color.rgb(255, 50, 50)
+        
+        string pct_text = f_pct_str(val, base_val)
+        label pct_lbl = label.new(sdp_x2 + 1, strike_lvl, pct_text + "\n ",
+            xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left,
+            color=color.new(color.black, 100), textcolor=f_pct_col(val, base_val),
+            size=size.large, force_overlay=true)
+        array.push(pct_labels, pct_lbl)
+
+        label rank_lbl = label.new(sdp_x2 + 1, strike_lvl, " \n[ " + dom_str + " | " + rank_str + " ]",
+            xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left,
+            color=color.new(color.black, 100), textcolor=dom_clr,
+            size=size.large, force_overlay=true)
+        array.push(pct_labels, rank_lbl)
+
+if barstate.islast
+    // ─── Meticulous Debug Panel ──────────────────────────────────────────────
+    if sdp_show_diag
+        string t_atm_c = f_sdp_tk(sdp_atm, "C")
+        string t_atm_p = f_sdp_tk(sdp_atm, "P")
+        
+        string dbg = "━━━ SDP ALIGNMENT DIAGNOSTIC ━━━\n"
+        dbg += "Chart Entity: [" + syminfo.prefix + ":" + syminfo.root + "]\n"
+        dbg += "Derived Root: " + sdp_opt_root + "\n"
+        dbg += "Input Expiry: " + sdp_exp + "\n"
+        dbg += "Step Trigger: " + str.tostring(sdp_step) + "\n"
+        dbg += "Input ATM:    " + str.tostring(sdp_atm) + "\n\n"
+        dbg += "Gen CE String: " + t_atm_c + "\n"
+        dbg += "Gen PE String: " + t_atm_p + "\n\n"
+        dbg += "Live CE Value: " + str.tostring(sdp_ce_0) + "\n"
+        dbg += "Live PE Value: " + str.tostring(sdp_pe_0) + "\n\n"
+        dbg += "━━━ PHYSICS ENGINE V2 ━━━\n"
+        dbg += "ComparatorScore: " + str.tostring(ComparatorScore, "#.####") + "\n"
+        dbg += "ATM Dominance:   " + str.tostring(g_0, "#.####") + "\n"
+        dbg += "ATM Weight:      " + str.tostring(w_0, "#.####") + "\n"
+        dbg += "Index ATR:       " + str.tostring(idx_atr, "#.##") + "\n"
+        
+        if not sdp_active
+            dbg += "\n[!] ASSET GUARD BLOCKED: Asset not supported.\n"
+            dbg += "Your current chart prefix is: '" + syminfo.prefix + "'.\n"
+            dbg += "This script supports NSE/BSE indices, MCX commodities, and NSE:MCX stock."
+        else if na(sdp_ce_0) and na(sdp_pe_0)
+            dbg += "\n[!] CRITICAL FAILURE: TradingView returned NaN (No Data).\n"
+            dbg += "The string (" + t_atm_c + ") is being rejected by the exchange.\n"
+            dbg += "Check manually if this exact ticker exists."
+            
+        if na(sdp_debug_lbl)
+            sdp_debug_lbl := label.new(bar_index + sdp_offset + 10, close, dbg,
+              xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left,
+              color=color.new(color.black, 20), textcolor=color.rgb(0,0,0), size=size.large,
+              force_overlay=true, text_font_family=font.family_monospace)
+        else
+            label.set_xy(sdp_debug_lbl, bar_index + sdp_offset + 10, close)
+            label.set_text(sdp_debug_lbl, dbg)
+    else if not na(sdp_debug_lbl)
+        label.delete(sdp_debug_lbl)
+        sdp_debug_lbl := na
+

@@ -1,0 +1,196 @@
+
+/// @function f_Structural_Bias_629
+/// @description State-of-the-art structural bias engine. 20 geometric features scored through
+///              a 31-point physics engine + 9 manual conditions. Returns bias, consensus, and dispersion.
+/// @param o {float} Heikin-Ashi open.
+/// @param h {float} Heikin-Ashi high.
+/// @param l {float} Heikin-Ashi low.
+/// @param c {float} Heikin-Ashi close.
+/// @returns [float upBias, float downBias, float consensus, float dispersion]
+///   upBias + downBias = 1.0 always.
+///   consensus ∈ [0,1]: fraction of features individually favoring bulls (breadth).
+///   dispersion ∈ [0,1]: normalized std-dev of feature scores (intensity/polarization).
+
+// ==============================================================================
+// STRUCTURAL BIAS V2: 629-Point Constant-Sum Engine
+// ==============================================================================
+// Architecture:
+//   20 features × 31 pts = 620 (physics) + 9 manual × 1 pt = 629. Always conserved.
+//
+// Output dimensions:
+//   1. BIAS       — which side dominates (direction)
+//   2. CONSENSUS  — how many features agree (breadth)
+//   3. DISPERSION — how strongly features diverge (intensity)
+//
+// Decision surface:
+//   High bias + High consensus + Low dispersion  = DRIFT (weak trend)
+//   High bias + High consensus + High dispersion = STRONG TREND (conviction)
+//   High bias + Low consensus  + High dispersion = THINNING (exhaustion warning)
+//   Mid bias  + Low consensus  + High dispersion = POLARIZED (reversal imminent)
+//   Mid bias  + High consensus + Low dispersion  = INDECISION (sit out)
+// ==============================================================================
+
+export f_Structural_Bias_629(float o, float h, float l, float c) =>
+
+    // --- GEOMETRIC DEFINITIONS ---
+    near_high    = math.max(o, c)
+    near_low     = math.min(o, c)
+    avg_value    = math.avg(o, h, l, c)
+    candle_mid   = (h + l) / 2
+    candle_joint = (c[1] + o) / 2
+
+    // Deterministic Geometric Midpoints
+    r_bottom = math.avg(l, near_low)
+    r_body   = math.avg(near_low, near_high)
+    r_top    = math.avg(near_high, h)
+
+    body_ratio    = (c - o) / math.max(h - l, 1)
+    net_thrust    = (c - l) / (math.max(h - c, 1))
+    range_vector  = (h - l) * math.sign(c - o)
+    uw            = h - near_high
+    lw            = near_low - l
+    [mx, mn]      = f_MxMn(o, h, l, c)
+    c_old_candle  = 4*c - (o+h+l+c)[1]
+
+    // Body position: signed offset of body center from range center
+    body_position = (o + c) / 2 - (h + l) / 2
+
+    size_cng = ta.change(math.sqrt((h - l) * math.abs(c - o)))
+
+    // ================================================================
+    // SCORING: Call physics engine ONCE per feature (UP side only).
+    // DOWN score = 31 - UP score (by conservation).
+    // ================================================================
+    _s01 = f_value_chng_IV(o, 1)
+    _s02 = f_value_chng_IV(near_high, 1)
+    _s03 = f_value_chng_IV(near_low, 1)
+    _s04 = f_value_chng_IV(c, 1)
+    _s05 = f_value_chng_IV(r_top, 1)
+    _s06 = f_value_chng_IV(candle_joint, 1)
+    _s07 = f_value_chng_IV(uw - lw, 1)
+    _s08 = f_value_chng_IV(candle_mid, 1)
+    _s09 = f_value_chng_IV(avg_value, 1)
+    _s10 = f_value_chng_IV(net_thrust, 1)
+    _s11 = f_value_chng_IV(body_ratio, 1)
+    _s12 = f_value_chng_IV(range_vector, 1)
+    _s13 = f_value_chng_IV(mn, 1)
+    _s14 = f_value_chng_IV(mx, 1)
+    _s15 = f_value_chng_IV(r_bottom, 1)
+    _s16 = f_value_chng_IV(r_body, 1)
+    _s17 = f_value_chng_IV(h, 1)
+    _s18 = f_value_chng_IV(l, 1)
+    _s19 = f_value_chng_IV(c_old_candle, 1)
+    _s20 = f_value_chng_IV(body_position, 1)
+
+    // --- AGGREGATE ---
+    // 20 features × 31 pts = 620 pts (conserved)
+    upFeatures = _s01 + _s02 + _s03 + _s04 + _s05 + _s06 + _s07 + _s08 + _s09 + _s10 + _s11 + _s12 + _s13 + _s14 + _s15 + _s16 + _s17 + _s18 + _s19 + _s20
+    downFeatures = 620.0 - upFeatures
+
+    // ================================================================
+    // CONSENSUS: How many features individually favor bulls?
+    // (breadth of agreement across features)
+    // ================================================================
+    _half = 15.5  // midpoint of [0, 31]
+    _con  = 0
+    _con += _s01 > _half ? 1 : 0
+    _con += _s02 > _half ? 1 : 0
+    _con += _s03 > _half ? 1 : 0
+    _con += _s04 > _half ? 1 : 0
+    _con += _s05 > _half ? 1 : 0
+    _con += _s06 > _half ? 1 : 0
+    _con += _s07 > _half ? 1 : 0
+    _con += _s08 > _half ? 1 : 0
+    _con += _s09 > _half ? 1 : 0
+    _con += _s10 > _half ? 1 : 0
+    _con += _s11 > _half ? 1 : 0
+    _con += _s12 > _half ? 1 : 0
+    _con += _s13 > _half ? 1 : 0
+    _con += _s14 > _half ? 1 : 0
+    _con += _s15 > _half ? 1 : 0
+    _con += _s16 > _half ? 1 : 0
+    _con += _s17 > _half ? 1 : 0
+    _con += _s18 > _half ? 1 : 0
+    _con += _s19 > _half ? 1 : 0
+    _con += _s20 > _half ? 1 : 0
+    consensus_pct = _con / 20.0
+
+    // ================================================================
+    // DISPERSION: Standard deviation of feature scores (normalized).
+    // Low  = all features scoring similarly (agreement or indecision)
+    // High = features strongly diverge (polarization or strong trend)
+    // Combined with consensus, separates 5 market regimes.
+    // ================================================================
+    _mean = upFeatures / 20.0
+    _var  = 0.0
+    _var += math.pow(_s01 - _mean, 2)
+    _var += math.pow(_s02 - _mean, 2)
+    _var += math.pow(_s03 - _mean, 2)
+    _var += math.pow(_s04 - _mean, 2)
+    _var += math.pow(_s05 - _mean, 2)
+    _var += math.pow(_s06 - _mean, 2)
+    _var += math.pow(_s07 - _mean, 2)
+    _var += math.pow(_s08 - _mean, 2)
+    _var += math.pow(_s09 - _mean, 2)
+    _var += math.pow(_s10 - _mean, 2)
+    _var += math.pow(_s11 - _mean, 2)
+    _var += math.pow(_s12 - _mean, 2)
+    _var += math.pow(_s13 - _mean, 2)
+    _var += math.pow(_s14 - _mean, 2)
+    _var += math.pow(_s15 - _mean, 2)
+    _var += math.pow(_s16 - _mean, 2)
+    _var += math.pow(_s17 - _mean, 2)
+    _var += math.pow(_s18 - _mean, 2)
+    _var += math.pow(_s19 - _mean, 2)
+    _var += math.pow(_s20 - _mean, 2)
+    // Normalize: max possible std-dev is 15.5 (half of 31, when all at 0 or all at 31)
+    dispersion = math.sqrt(_var / 20.0) / 15.5
+
+    // ================================================================
+    // MANUAL CONDITIONS (9 pts total, each conserved)
+    // ================================================================
+    upManual   = 0.0
+    downManual = 0.0
+
+    // 1. Close vs range midpoint
+    upManual   += c >= candle_mid ? 1 : 0
+    downManual += c <  candle_mid ? 1 : 0
+    // 2. Close vs typical price
+    upManual   += c >= avg_value ? 1 : 0
+    downManual += c <  avg_value ? 1 : 0
+    // 3. Close vs open (candle color)
+    upManual   += c >= o ? 1 : 0
+    downManual += c <  o ? 1 : 0
+    // 4. Support test: unchanged low = support held → bullish
+    upManual   += l == l[1] ? 1 : 0
+    downManual += l == l[1] ? 0 : 1
+    // 5. Resistance test: unchanged high = resistance held → bearish
+    upManual   += h == h[1] ? 0 : 1
+    downManual += h == h[1] ? 1 : 0
+    // 6. Anti-Sabotage XNOR Gate
+    is_green     = c >= o
+    is_expanding = size_cng >= 0
+    bull_energy  = (is_green and is_expanding) or (not is_green and not is_expanding)
+    upManual   += bull_energy ? 1 : 0
+    downManual += bull_energy ? 0 : 1
+    // 7. Structural Advance: Higher-High AND Higher-Low
+    _struct_bull = (h > h[1] and l > l[1])
+    upManual   += _struct_bull ? 1 : 0
+    downManual += _struct_bull ? 0 : 1
+    // 8. Structural Decline: Lower-High AND Lower-Low
+    _struct_bear = (h < h[1] and l < l[1])
+    upManual   += _struct_bear ? 0 : 1
+    downManual += _struct_bear ? 1 : 0
+    // 9. Wick Dominance: lower wick >= upper wick → bullish absorption
+    _wick_bull = (h - near_high) <= (near_low - l)
+    upManual   += _wick_bull ? 1 : 0
+    downManual += _wick_bull ? 0 : 1
+
+    // ================================================================
+    // FINAL: upScore + downScore = 620 + 9 = 629 (always)
+    // ================================================================
+    upScore   = upFeatures   + upManual
+    downScore = downFeatures + downManual
+
+    [upScore / 629, downScore / 629, consensus_pct, dispersion]
+

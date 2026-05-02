@@ -1,0 +1,506 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © majhikeshab5
+//
+// STRUCTURAL ANALYSIS [UNIFIED] — OPTIMIZED MASTERPIECE
+//
+// Built from Structural_Analysis_UNIFIED_fixed.pine [F1-F5] with:
+// [OPT-1] Cached array.size() — computed once, reused in both passes
+// [OPT-2] Eliminated comma-chained assignments — each on own line for clarity + safety
+// [OPT-3] nz(V,0) inside f_CustomSplitDelta — consistent with HTF Footprint [F1]
+// [OPT-4] active_slab as top-level var — explicit warm-prior, never reset
+// [OPT-5] Kalman slab option — optional smooth convergence (toggle, default OFF)
+// [OPT-6] safe_to_calc uses min_bars_sync properly (from [F2/F3])
+// [OPT-7] Proper str.endswith for option detection (from [F1])
+// [OPT-8] Compact ternary for container_reset
+// [OPT-9] Plot titles added for all plots
+// Core logic: UNCHANGED. All math/algorithms identical to UNIFIED_fixed.
+
+//@version=6
+indicator('Structural Analysis [UNIFIED]', precision=3)
+
+import bankniftyexplorer/kibrary/4 as k
+
+// =================================================================================================
+// 1. INPUTS & CONFIGURATION
+// =================================================================================================
+analysis      = input.string('TradingView', title='Delta Calculation Method', options=['TradingView', 'Own'])
+rsi_mode      = input.bool(false, 'RSI Mode? On/OFF')
+use_auto_tf   = input.bool(true, "Auto-Calculate LTF?")
+manual_res    = input.timeframe("1", "Manual LTF")
+delta_r_      = input.float(0.01, 'Measurement Noise (R) for Delta Candle')
+delta_q_      = input.float(0.01, 'Process Noise (Q) for Delta Candle')
+
+// Background & Noise
+BgLen         = input.int(10,     title='Length for Background Calculation')
+r_            = input.float(0.1,  'Measurement Noise (R) for Bg', minval=0.001)
+q_            = input.float(0.001,'Process Noise (Q) for Bg',     minval=0.0001)
+
+// Reference & Synchronization
+ref_symbol    = input.symbol("NSE:NIFTY", 'Reference Symbol')
+mode          = input.string('Main', 'Mode of Symbol Analysis', options=['Main', 'Reference', 'Both'])
+min_bars_sync = input.int(15, "Bridge: Bars to Wait", minval=1,
+  tooltip="Set relative to LTF. LTF=1s → 900 = 15min warmup. LTF=1m → 15 = 15min warmup.")
+
+// [OPT-5] Kalman slab — optional smooth convergence
+use_kalman_slab = input.bool(false, "Kalman Smooth Slab",
+  tooltip="Smooth slab convergence instead of power-of-10 snapping.",
+  group="Reference & Sync")
+kalman_q_slab = input.float(0.01, "Kalman Process Noise Q", minval=0.001, maxval=1.0, step=0.005,
+  group="Reference & Sync")
+kalman_r_slab = input.float(0.1, "Kalman Measurement Noise R", minval=0.01, maxval=10.0, step=0.01,
+  group="Reference & Sync")
+
+// Visual Parameters
+BgcolorLen    = input.int(100,  title='Length for Top Panel Background Study')
+sigmoid_k     = input.float(6.0,'Sigmoid Curve Parameter')
+length        = input.int(180,  title='Delta Volume MA Calculation Period', minval=2)
+ssfLength     = input.int(60,   title='Super Smoother Filter Length')
+ssfPoles      = input.int(2,    title='Super Smoother Filter Poles', options=[2, 3])
+MaColour      = input.color(color.rgb(0, 0, 0), title='EDSMA Colour')
+threshold     = input.float(1.33,'Candle Special Mark Threshold', minval=0.01)
+
+// =================================================================================================
+// 2. HELPER FUNCTIONS
+// =================================================================================================
+f_get_auto_res() =>
+    sec = timeframe.in_seconds(timeframe.period)
+    if sec <= 1800
+        "1"
+    else if sec <= 14400
+        "5"
+    else if sec <= 86400
+        "15"
+    else
+        "60"
+
+res = use_auto_tf ? f_get_auto_res() : manual_res
+
+method compare(float src) =>
+    k.f_value_chng_IV(src, 1) / 31.0
+
+
+
+f_dominant_cycle(float src, int min_period = 8, int max_period = 48) =>
+    var float period  = 0.0
+    var float smooth  = 0.0
+    var float detrend = 0.0
+    var float i1 = 0.0, var float q1 = 0.0
+    var float jI = 0.0, var float jQ = 0.0
+    var float i2 = 0.0, var float q2 = 0.0
+    var float re = 0.0, var float im = 0.0
+
+    // 1. Noise Elimination (Finite Impulse Response Smoothing)
+    smooth := (4.0 * src + 3.0 * nz(src[1]) + 2.0 * nz(src[2]) + nz(src[3])) / 10.0
+
+    // 2. Hilbert Detrending (Amplitude normalization scaling locked to the previous period state)
+    float p_prev = nz(period[1], min_period)
+    float alpha  = (0.0962 * smooth + 0.5769 * nz(smooth[2]) - 0.5769 * nz(smooth[4]) - 0.0962 * nz(smooth[6])) 
+    detrend      := alpha * (0.075 * p_prev + 0.54)
+
+    // 3. Synthesize In-Phase (I) and Quadrature (Q) complex states
+    q1 := (0.0962 * detrend + 0.5769 * nz(detrend[2]) - 0.5769 * nz(detrend[4]) - 0.0962 * nz(detrend[6])) * (0.075 * p_prev + 0.54)
+    i1 := nz(detrend[3])
+
+    // 4. Force 90-Degree Phase Orthogonality Advance
+    jI := (0.0962 * i1 + 0.5769 * nz(i1[2]) - 0.5769 * nz(i1[4]) - 0.0962 * nz(i1[6])) * (0.075 * p_prev + 0.54)
+    jQ := (0.0962 * q1 + 0.5769 * nz(q1[2]) - 0.5769 * nz(q1[4]) - 0.0962 * nz(q1[6])) * (0.075 * p_prev + 0.54)
+
+    // 5. Phasor Spatial Addition
+    i2 := i1 - jQ
+    q2 := q1 + jI
+
+    // 6. Vector Component Stabilization
+    i2 := 0.2 * i2 + 0.8 * nz(i2[1])
+    q2 := 0.2 * q2 + 0.8 * nz(q2[1])
+
+    // 7. Homodyne Discriminator (Calculates purely the geometric Phase Rate of Change per bar)
+    re := i2 * nz(i2[1]) + q2 * nz(q2[1])
+    im := i2 * nz(q2[1]) - q2 * nz(i2[1])
+
+    re := 0.2 * re + 0.8 * nz(re[1])
+    im := 0.2 * im + 0.8 * nz(im[1])
+
+    // 8. Wavelength Measurement (Bars per Cycle = 2pi Radians / Phase Velocity)
+    float calc_period = p_prev
+    if re != 0 and im != 0
+        calc_period := 2.0 * math.pi / math.atan(im / re)
+
+    // 9. Kinetic Boundary Enforcement & Shock Protection
+    // Prevents extreme volatile gaps from breaking the algorithm's phase lock
+    calc_period := math.max(calc_period, p_prev * 0.67) 
+    calc_period := math.min(calc_period, p_prev * 1.5)
+    calc_period := math.max(calc_period, min_period)
+    calc_period := math.min(calc_period, max_period)
+
+    // 10. Final Exponential Smoothing of the Temporal Array
+    period := 0.2 * calc_period + 0.8 * p_prev
+
+    period
+
+// [OPT-3] nz(V, 0) — consistent with HTF Footprint [F1]
+// Inside request.security_lower_tf, nz(volume, 1) is passed — but the function's own
+// nz(V, 0) overrides it. This ensures zero volume contributes zero delta.
+f_CustomSplitDelta(float O, float H, float L, float C, float V, int dir) =>
+    tw         = math.max(H, C[1]) - math.max(O, C)
+    bw         = math.min(O, C)    - math.min(L, C[1])
+    body       = math.abs(O - C)
+    sm         = bw + (C - O) - tw
+    cond       = sm >= 0
+    total_sq   = (tw * tw) + (bw * bw) + (body * body)
+    buy_share  = (bw * bw) + (cond      ? (body * body) : 0)
+    sell_share = (tw * tw) + (not cond  ? (body * body) : 0)
+    retU       = total_sq > 0 ? (buy_share  / total_sq) : 0.5
+    retD       = total_sq > 0 ? (sell_share / total_sq) : 0.5
+    dir == 1 ? nz(V, 0) * retU : nz(V, 0) * retD
+
+f_Adaptive_Length_Cum(float src, int length) =>
+    int   safe_len = math.max(length, 1)
+    float decay    = (safe_len - 1) / safe_len
+    var float cum_wave = 0.0
+    cum_wave := nz(src) + (nz(cum_wave[1]) * decay)
+    cum_wave
+
+f_get_up() =>
+    if analysis == 'TradingView'
+        f_CustomSplitDelta(open, high, low, close, nz(volume, 1), 1)
+    else
+        [du, _dd, _con, _dis] = k.f_Structural_Bias_629(open, high, low, close)
+        du
+
+f_get_dn() =>
+    if analysis == 'TradingView'
+        f_CustomSplitDelta(open, high, low, close, nz(volume, 1), 0)
+    else
+        [_du, dd, _con, _dis] = k.f_Structural_Bias_629(open, high, low, close)
+        dd
+
+// =================================================================================================
+// 3. DATA FETCHING
+// =================================================================================================
+[main_ltf_times, main_ltf_c, main_ltf_vol, main_ltf_du, main_ltf_dd] =
+ request.security_lower_tf(syminfo.tickerid, res, [time, close, nz(volume, 1), f_get_up(), f_get_dn()])
+
+[ref_ltf_times, ref_ltf_vol, ref_ltf_du, ref_ltf_dd] =
+ request.security_lower_tf(ref_symbol, res, [time, nz(volume, 1), f_get_up(), f_get_dn()])
+
+ref_info_type = request.security(ref_symbol, timeframe.period, syminfo.type)
+
+// =================================================================================================
+
+// Asset Classification Matrix
+isMainOption   = syminfo.type == "option"
+isRefOption    = ref_info_type == "option"
+isMainNSEorBSE = syminfo.prefix == 'NSE' or syminfo.prefix == "BSE"
+isRefNSEorBSE  = syminfo.prefix(ref_symbol) == 'NSE' or syminfo.prefix(ref_symbol) == "BSE"
+
+isMainCALL     = str.contains(syminfo.ticker, "C") and isRefNSEorBSE 
+isMainPUT      = str.contains(syminfo.ticker, "P") and isRefNSEorBSE 
+isRefCALL      = str.contains(ref_symbol, "C") and isRefOption and isRefNSEorBSE
+isRefPUT       = str.contains(ref_symbol, "P") and isRefOption and isRefNSEorBSE
+
+// Logic inversion required for synthetic strength calculations
+special_option_consideration = isMainOption and isMainNSEorBSE and ((isMainPUT and not isRefPUT) or (isMainCALL and isRefPUT))
+
+
+
+
+// =================================================================================================
+// 5. MACRO VAULT (Session Memory)
+// =================================================================================================
+float htf_sec = timeframe.in_seconds(timeframe.period)
+
+// [OPT-8] Compact ternary chain for container reset
+bool is_container_reset = htf_sec < 86400.0  ? ta.change(time("D")) != 0 :
+ htf_sec < 604800.0 ? ta.change(time("W")) != 0 :
+ ta.change(time("M")) != 0
+
+var float macro_main_v   = 0.0
+var float macro_ref_v    = 0.0
+var int   macro_sess_cnt = 0
+
+// [OPT-4] active_slab at top level as var — warm prior, NOT reset on session open
+var float active_slab = 1.0
+
+// [OPT-5] Kalman state
+var float kal_x = 0.0
+var float kal_p = 1.0
+
+if is_container_reset
+    macro_main_v   := 0.0
+    macro_ref_v    := 0.0
+    macro_sess_cnt := 0
+    // active_slab intentionally NOT reset — carries yesterday's calibration
+    if use_kalman_slab
+        kal_p := 1.0   // reset covariance for clean convergence in new session
+
+// =================================================================================================
+// 6. TWO-PASS UNIFIED MICROSTRUCTURE ENGINE
+// =================================================================================================
+float chart_tf_delta = 0.0
+float live_main_v    = 0.0
+float live_ref_v     = 0.0
+int   live_cnt       = 0
+
+// [OPT-1] Cache array sizes once — avoid repeated function calls
+int main_sz = array.size(main_ltf_times)
+int ref_sz  = array.size(ref_ltf_times)
+
+if main_sz > 0 and ref_sz > 0
+
+    // =========================================================================
+    // PASS 1 — SCOUT: accumulate this bar's LTF volume
+    // =========================================================================
+    int r_idx_scout = 0
+    for i = 0 to main_sz - 1                           // [OPT-1] cached
+        int main_t = array.get(main_ltf_times, i)
+        while r_idx_scout < ref_sz - 1 and array.get(ref_ltf_times, r_idx_scout) < main_t
+            r_idx_scout += 1
+
+        bool  match  = array.get(ref_ltf_times, r_idx_scout) == main_t
+        float t_main = math.abs(nz(array.get(main_ltf_vol, i)))
+        float t_ref  = match ? math.abs(nz(array.get(ref_ltf_vol, r_idx_scout))) : 0.0
+
+        live_main_v += t_main
+        live_ref_v  += t_ref
+        live_cnt    += 1
+
+    // =========================================================================
+    // UNIFORM SLAB CALCULATION
+    // [OPT-6 / F2+F3] Gate uses min_bars_sync against cumulative tick count
+    // =========================================================================
+    float current_total_main = macro_main_v + live_main_v
+    float current_total_ref  = macro_ref_v  + live_ref_v
+    int   current_total_cnt  = macro_sess_cnt + live_cnt
+
+    if current_total_ref > 0 and current_total_main > 0 and current_total_cnt >= min_bars_sync
+        float current_ratio = current_total_main / current_total_ref
+        if use_kalman_slab
+            // [OPT-5] 1D Kalman filter on log10(ratio) — smooth convergence
+            float z      = math.log10(current_ratio)
+            float p_pred = kal_p + kalman_q_slab
+            float k_gain = p_pred / (p_pred + kalman_r_slab)
+            kal_x := kal_x + k_gain * (z - kal_x)
+            kal_p := (1.0 - k_gain) * p_pred
+            active_slab := math.pow(10, kal_x)
+        else
+            active_slab := math.pow(10, math.max(-15.0, math.min(15.0, math.round(math.log10(current_ratio)))))
+
+    // =========================================================================
+    // safe_to_calc — re-gates every session until warmup is complete [F3]
+    // =========================================================================
+    bool safe_to_calc = current_total_cnt >= min_bars_sync
+
+    // =========================================================================
+    // PASS 2 — BUILDER: all ticks use the same frozen active_slab
+    // =========================================================================
+    if true
+        int r_idx = 0
+        for i = 0 to main_sz - 1                       // [OPT-1] cached
+            int main_t = array.get(main_ltf_times, i)
+            while r_idx < ref_sz - 1 and array.get(ref_ltf_times, r_idx) < main_t
+                r_idx += 1
+
+            bool  match       = array.get(ref_ltf_times, r_idx) == main_t
+            float ref_du_raw  = match ? array.get(ref_ltf_du,  r_idx) : 0.0
+            float ref_dd_raw  = match ? array.get(ref_ltf_dd,  r_idx) : 0.0
+            float r_vol_raw   = match ? array.get(ref_ltf_vol, r_idx) : 0.0
+
+            float ref_du_scaled  = ref_du_raw  * active_slab
+            float ref_dd_scaled  = ref_dd_raw  * active_slab
+            float ref_vol_scaled = r_vol_raw   * active_slab
+
+            float main_du  = array.get(main_ltf_du,  i)
+            float main_dd  = array.get(main_ltf_dd,  i)
+            float main_vol = array.get(main_ltf_vol, i)
+
+            if not na(main_vol) and not na(ref_vol_scaled)
+
+                // [OPT-2] Each assignment on its own line — no comma chaining
+                if mode == 'Main'
+                    ref_du_scaled  := 0.0
+                    ref_dd_scaled  := 0.0
+                    ref_vol_scaled := 0.0
+
+                else if mode == 'Reference'
+                    main_du  := 0.0
+                    main_dd  := 0.0
+                    main_vol := 0.0
+                    if special_option_consideration
+                        float temp    = ref_du_scaled
+                        ref_du_scaled := ref_dd_scaled
+                        ref_dd_scaled := temp
+
+                else // Both
+                    // [F4] Flip also applies in 'Both' mode — intentional.
+                    // PUT + Index: index sell = synthetic PUT buy. Without flip, signals oppose.
+                    if special_option_consideration
+                        float temp    = ref_du_scaled
+                        ref_du_scaled := ref_dd_scaled
+                        ref_dd_scaled := temp
+
+                float final_du = na
+                float final_dd = na
+
+                if isMainOption and isMainNSEorBSE
+                    if (isMainPUT and not isRefPUT) or (isMainCALL and not isRefCALL)
+                        final_du := main_du + ref_du_scaled
+                        final_dd := main_dd + ref_dd_scaled
+                    // else: option type mismatch — leave na, skip delta contribution
+                else
+                    final_du := main_du + ref_du_scaled
+                    final_dd := main_dd + ref_dd_scaled
+
+                if not na(final_du) and not na(final_dd)
+                    if analysis == 'TradingView'
+                        chart_tf_delta += (final_du - final_dd)
+                    else
+                        float denom     = (final_du * final_du) + (final_dd * final_dd)
+                        float pure_bias = 0.0
+
+                        // UNDERFLOW SHIELD [F5]
+                        // denom == 0 means final_du = final_dd = 0 (float collapse)
+                        // Fall back to raw ref ratio as best available signal
+                        if denom == 0 and (ref_du_raw != 0 or ref_dd_raw != 0)
+                            float raw_denom = (ref_du_raw * ref_du_raw) + (ref_dd_raw * ref_dd_raw)
+                            pure_bias := raw_denom == 0 ? 0 :
+                             ((ref_du_raw * ref_du_raw) - (ref_dd_raw * ref_dd_raw)) / raw_denom
+                        else
+                            pure_bias := denom == 0 ? 0 :
+                             ((final_du * final_du) - (final_dd * final_dd)) / denom
+
+                        chart_tf_delta += (pure_bias * (main_vol + ref_vol_scaled))
+
+// VAULT COMMIT — only on bar close, prevents live-tick double accumulation
+if barstate.isconfirmed
+    macro_main_v   += live_main_v
+    macro_ref_v    += live_ref_v
+    macro_sess_cnt += live_cnt
+
+// =================================================================================================
+// 7. SIGNAL FILTERS & GEOMETRICS
+// =================================================================================================
+// ─── CHART-TF STRUCTURAL REGIME ───
+[_price_bias_up, _price_bias_dn, _regime_consensus, _regime_dispersion] = k.f_Structural_Bias_629(open, high, low, close)
+
+bool  _own_mode = analysis != 'TradingView'
+
+// ─── 3D REGIME CLASSIFIER (Bias × Consensus × Dispersion) ───
+// Activates all 4 output dimensions of the 629-pt engine.
+// regime: 1=DRIFT, 2=STRONG TREND, 3=THINNING, 4=POLARIZED, 5=INDECISION
+float _bias_magnitude     = math.abs(_price_bias_up - 0.5) * 2.0    // [0,1]: 0=neutral, 1=extreme
+float _consensus_strength = math.abs(_regime_consensus - 0.5) * 2.0  // [0,1]: 0=split, 1=unanimous
+bool  _high_bias = _bias_magnitude > 0.20
+bool  _high_con  = _consensus_strength > 0.20
+bool  _high_disp = _regime_dispersion > 0.25
+int   regime = _high_bias and _high_con  and _high_disp           ? 2 :
+               _high_bias and (not _high_con) and _high_disp      ? 3 :
+               (not _high_bias) and (not _high_con) and _high_disp ? 4 :
+               _high_bias and _high_con  and (not _high_disp)     ? 1 :
+               5
+
+cdv = analysis == 'TradingView'
+ ? f_Adaptive_Length_Cum(chart_tf_delta, length)
+ : f_Adaptive_Length_Cum(chart_tf_delta, length)
+//k.f_kalman(f_Adaptive_Length_Cum(chart_tf_delta, length), delta_q_, delta_r_)
+
+final_delta_src = rsi_mode ? ta.rsi(cdv, BgLen) : cdv
+
+[_o, _h, _l, _c, _avg, _dir] = k.HeikinAshi(final_delta_src[1], final_delta_src)
+
+// Calculate dynamic structural latency (Optimal input is hl2 for center of gravity)
+
+int dynamic_BgLen = math.round(f_dominant_cycle(math.pow(high*low,0.5), 10, 48))
+
+bool isMainIndex   = syminfo.type == "index"
+
+[MaxMove, EngagedVol] = k.f_mrd(volume, dynamic_BgLen)
+float EngagedVolCompare = isMainIndex ? 1.0 : EngagedVol.compare()
+float colour_base = k.f_PercentBg(math.sum((MaxMove.compare()*EngagedVolCompare), BgLen), q_, r_, BgcolorLen, sigmoid_k)
+color bg_upper    = color.rgb(colour_base, colour_base, colour_base)
+
+float BG_down  = math.sum(final_delta_src.compare(), BgLen) / BgLen
+
+int   sig255   = math.floor(k.f_sigmoid(k.f_kalman(BG_down, q_, r_), BgLen) * 255)
+color Y2B_down = color.rgb(sig255, sig255, 255 - sig255)
+
+// ─── STRUCTURAL DIVERGENCE ───
+// Own mode: continuous intensity scoring (product of opposing directions).
+// TradingView mode: original binary threshold detection.
+float struct_direction = _regime_consensus - 0.5
+float cdv_direction    = BG_down - 0.5
+float divergence_score = -4.0 * struct_direction * cdv_direction
+bool  _divergence = _own_mode ? divergence_score > 0.10 :
+ ((_regime_consensus > 0.55 and BG_down < 0.45) or (_regime_consensus < 0.45 and BG_down > 0.55))
+float _div_intensity = _own_mode and _divergence ? math.min(divergence_score * 3.0, 1.0) : 0.0
+int   _div_transp    = _own_mode ? math.round((1.0 - _div_intensity) * 70.0) : 0
+
+// =================================================================================================
+// 8. EDSMA & VOLATILITY BANDS
+// =================================================================================================
+[mx, mn] = k.f_MxMn(_o, _h, _l, _c)
+
+float ma    = k.f_Edsma(mx, length, ssfLength, ssfPoles)
+float dev_u = k.f_Edsma(math.abs(ma - _h), length, ssfLength, ssfPoles)
+float dev_d = k.f_Edsma(math.abs(ma - _l), length, ssfLength, ssfPoles)
+
+// Anomaly Z-Score: geometric mean of asymmetric deviations × candle geometry
+float special_dev   = math.pow(dev_u * dev_d * (_h - _l) * math.abs(_c - _o), 0.25)
+float StdspecialDev = k.f_Edsma(special_dev, length, ssfLength, ssfPoles)
+
+// Guard: zero volatility bars produce StdspecialDev = 0
+float Z = StdspecialDev == 0 ? 0 : special_dev / StdspecialDev
+
+// ─── ADAPTIVE ANTI-CHOP Z-SCORE ───
+float disp_mean = ta.sma(_regime_dispersion, 20)
+float disp_std  = ta.stdev(_regime_dispersion, 20)
+float disp_z    = disp_std == 0 ? 0 : (_regime_dispersion - disp_mean) / disp_std
+// Own mode: regime-aware EQ gating. TradingView mode: dispersion Z-score only.
+bool  eq_allowed = disp_z > 0.0 and (_own_mode ? (regime >= 2 and regime <= 4) : true)
+
+bool EQlow  = threshold <= Z[1] and _l[1] == _l and ta.change(Z) < 0 and _c < _c[1] and eq_allowed
+bool EQhigh = threshold <= Z[1] and _h[1] == _h and ta.change(Z) < 0 and _c > _c[1] and eq_allowed
+
+float LargeH = ta.highest(_h - _l, length)
+
+// Guard: flat bars (_h == _l) must not trigger large-candle blackout/whiteout
+bool is_large = (_h - _l) > 0 and LargeH == (_h - _l)
+color base_col = is_large
+ ? (_o <= _c ? color.rgb(255, 255, 255) : color.rgb(0, 0, 0))
+ : _o >= _c ? color.rgb(255, 0, 0) : color.rgb(0, 255, 0)
+
+// ─── REGIME-AWARE CANDLE BODY (Own mode only) ───
+// Preserves up/down delta direction via Bright (Bullish) and Dark (Bearish) shading.
+// 2=TREND: Lime / Red
+// 3=THINNING: Bright Orange / Deep Orange
+// 4=POLARIZED: Magenta / Indigo
+// 1=DRIFT: Cyan / Deep Teal
+// 5=INDECISION: White / Black
+bool  _is_bull = _o <= _c
+color c_col = not _own_mode ? base_col :
+ regime == 2 ? (_is_bull ? color.rgb(0, 255, 0)   : color.rgb(255, 0, 0)) :
+ regime == 3 ? (_is_bull ? color.rgb(255, 140, 0) : color.rgb(180, 60, 0)) :
+ regime == 4 ? (_is_bull ? color.rgb(255, 0, 255) : color.rgb(75, 0, 130)) :
+ regime == 1 ? (_is_bull ? color.rgb(0, 255, 255) : color.rgb(0, 100, 100)) :
+ (_is_bull ? color.rgb(255, 255, 255) : color.rgb(0, 0, 0))
+
+// =================================================================================================
+// 9. PLOTTING
+// =================================================================================================
+bool isCandle = true
+
+plotcandle(isCandle ? _o : na, isCandle ? _h : na, isCandle ? _l : na, isCandle ? _c : na,
+ color=c_col, bordercolor=color.rgb(0, 0, 0), wickcolor=c_col, title="Delta Candles")
+
+plot(ma, "EDSMA", color=MaColour, linewidth=1)
+plot(ma, "EQ Signal", color=EQhigh ? color.red : EQlow ? color.green : _divergence ? color.new(color.rgb(255, 165, 0), _div_transp) : na, linewidth=3)
+
+plot(not isCandle ? final_delta_src : na, "Raw Delta",
+ color=final_delta_src < final_delta_src[1] ? color.rgb(255, 0, 64) : color.rgb(0, 255, 64),
+ style=plot.style_columns)
+
+bgcolor(Y2B_down, title='Lower Background')
+bgcolor(bg_upper,  title='Upper Background', force_overlay=true)
+
+plot(ma + dev_u, "Upper Boundary", color=color.rgb(96, 0, 0))
+plot(ma - dev_d, "Lower Boundary", color=color.rgb(0, 96, 0))
+

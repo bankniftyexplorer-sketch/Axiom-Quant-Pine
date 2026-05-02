@@ -13,3 +13,6 @@ pinescript-dev/graphify-out/
 
 # Git
 .git/
+.venv/
+.vscode/
+.playwright-cli/
